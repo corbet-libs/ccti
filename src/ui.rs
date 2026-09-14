@@ -25,13 +25,21 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::comfy::{self, Client};
+use crate::prov::{self, Generation};
 
 /// Messages into the UI loop (agent task, render tasks, watcher).
 #[derive(Debug)]
 pub enum UiMsg {
-    Chat { role: String, text: String },
+    Chat {
+        role: String,
+        text: String,
+    },
     Status(String),
-    Image { label: String, bytes: Vec<u8> },
+    Image {
+        label: String,
+        bytes: Vec<u8>,
+        generation: Option<Generation>,
+    },
     AgentBusy(bool),
     AgentDone,
     Error(String),
@@ -40,6 +48,7 @@ pub enum UiMsg {
 struct GalleryItem {
     label: String,
     bytes: Vec<u8>,
+    generation: Option<Generation>,
     proto: Option<Protocol>,
 }
 
@@ -102,10 +111,11 @@ impl App {
         }
     }
 
-    fn push_image(&mut self, label: String, bytes: Vec<u8>) {
+    fn push_image(&mut self, label: String, bytes: Vec<u8>, generation: Option<Generation>) {
         self.gallery.push(GalleryItem {
             label,
             bytes,
+            generation,
             proto: None,
         });
         self.gidx = self.gallery.len() - 1;
@@ -185,8 +195,8 @@ async fn run_inner() -> Result<()> {
                         }
                     }
                     UiMsg::Status(s) => app.status = s,
-                    UiMsg::Image { label, bytes } => {
-                        app.push_image(label.clone(), bytes);
+                    UiMsg::Image { label, bytes, generation } => {
+                        app.push_image(label.clone(), bytes, generation);
                         app.chat.push(("sys".into(), format!("image: {label}")));
                     }
                     UiMsg::AgentBusy(b) => {
@@ -242,6 +252,35 @@ async fn run_inner() -> Result<()> {
     Ok(())
 }
 
+/// Bottom-left provenance panel: what produced the visible picture.
+fn prov_lines(generation: Option<&Generation>) -> Vec<String> {
+    let Some(g) = generation else {
+        return vec!["no provenance recorded (pre-0.1.2 render)".to_string()];
+    };
+    let mut prompt = g.prompt.replace('\n', " ");
+    if prompt.chars().count() > 160 {
+        prompt = format!("{}…", prompt.chars().take(159).collect::<String>());
+    }
+    vec![
+        format!("prompt: {prompt}"),
+        format!("model: {}", short_ckpt(&g.ckpt)),
+        format!(
+            "{}x{} · {} steps · seed {} · {}/{} · {}",
+            g.width,
+            g.height,
+            g.steps,
+            g.seed,
+            g.index + 1,
+            g.n,
+            g.software,
+        ),
+    ]
+}
+
+fn short_ckpt(ckpt: &str) -> String {
+    ckpt.rsplit('/').next().unwrap_or(ckpt).to_string()
+}
+
 fn split_long(text: &str) -> Vec<String> {
     text.lines()
         .map(|l| {
@@ -262,7 +301,13 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
         .split(area);
     let (img_rect, chat_rect) = split(rows[0]);
 
-    // Image pane (left, ~80).
+    // Image pane (left, ~80): picture on top, provenance below.
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(8)])
+        .split(img_rect);
+    let pic_rect = left[0];
+    let prov_rect = left[1];
     let title = if app.gallery.is_empty() {
         "image — nothing rendered yet".to_string()
     } else {
@@ -276,19 +321,30 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     };
     f.render_widget(
         Block::default().borders(Borders::ALL).title(title),
-        img_rect,
+        pic_rect,
     );
     if let Some(item) = app.gallery.get(app.gidx)
         && let Some(proto) = &item.proto
     {
         let inner = Rect {
-            x: img_rect.x + 1,
-            y: img_rect.y + 1,
-            width: img_rect.width.saturating_sub(2),
-            height: img_rect.height.saturating_sub(2),
+            x: pic_rect.x + 1,
+            y: pic_rect.y + 1,
+            width: pic_rect.width.saturating_sub(2),
+            height: pic_rect.height.saturating_sub(2),
         };
         f.render_widget(Image::new(proto), inner);
     }
+    let prov = prov_lines(
+        app.gallery
+            .get(app.gidx)
+            .and_then(|i| i.generation.as_ref()),
+    );
+    f.render_widget(
+        Paragraph::new(prov.join("\n"))
+            .block(Block::default().borders(Borders::ALL).title("provenance"))
+            .wrap(Wrap { trim: true }),
+        prov_rect,
+    );
 
     // Chat pane (right, ~20).
     let cols = Layout::default()
@@ -362,7 +418,7 @@ fn handle_command(
         "quit" | "q" => return false,
         "help" | "h" => {
             let _ = tx.send(UiMsg::Chat { role: "sys".into(), text:
-                "/render TEXT [--w N --h N --steps N] direct render · /models list checkpoints · /cancel stop agent turn · ←/→ image history · /quit".into() });
+                "/render TEXT [--w N --h N --steps N --n 1-4] direct render (fast defaults: 512px, 8 steps) · /models list checkpoints · /cancel stop agent turn · ←/→ image history · /quit".into() });
         }
         "cancel" => agent.cancel(),
         "models" => {
@@ -394,10 +450,10 @@ fn handle_command(
         }
         "render" => {
             let rest = line[1..].trim_start_matches("render").trim().to_string();
-            let (prompt, w, h, steps) = parse_render(&rest);
+            let (prompt, w, h, steps, n) = parse_render(&rest);
             if prompt.is_empty() {
                 let _ = tx.send(UiMsg::Error(
-                    "usage: /render TEXT [--w N --h N --steps N]".into(),
+                    "usage: /render TEXT [--w N --h N --steps N --n 1-4]".into(),
                 ));
                 return true;
             }
@@ -405,7 +461,7 @@ fn handle_command(
             let c = comfy.clone();
             let prompt2 = prompt.clone();
             tokio::spawn(async move {
-                direct_render(&c, &tx2, &prompt2, w, h, steps).await;
+                direct_render(&c, &tx2, &prompt2, w, h, steps, n).await;
             });
             let _ = tx.send(UiMsg::Chat {
                 role: "you".into(),
@@ -419,8 +475,8 @@ fn handle_command(
     true
 }
 
-fn parse_render(rest: &str) -> (String, u32, u32, u32) {
-    let (mut w, mut h, mut steps) = (768_u32, 768_u32, 10_u32);
+fn parse_render(rest: &str) -> (String, u32, u32, u32, u32) {
+    let (mut w, mut h, mut steps, mut n) = (512_u32, 512_u32, 8_u32, 1_u32);
     let mut words: Vec<&str> = Vec::new();
     let mut it = rest.split_whitespace().peekable();
     while let Some(tok) = it.next() {
@@ -428,10 +484,17 @@ fn parse_render(rest: &str) -> (String, u32, u32, u32) {
             "--w" => w = it.next().and_then(|v| v.parse().ok()).unwrap_or(w),
             "--h" => h = it.next().and_then(|v| v.parse().ok()).unwrap_or(h),
             "--steps" => steps = it.next().and_then(|v| v.parse().ok()).unwrap_or(steps),
+            "--n" => {
+                n = it
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(n)
+                    .clamp(1, 4)
+            }
             _ => words.push(tok),
         }
     }
-    (words.join(" "), w, h, steps)
+    (words.join(" "), w, h, steps, n)
 }
 
 async fn direct_render(
@@ -441,6 +504,7 @@ async fn direct_render(
     w: u32,
     h: u32,
     steps: u32,
+    n: u32,
 ) {
     let send = |m: UiMsg| {
         let _ = tx.send(m);
@@ -456,7 +520,7 @@ async fn direct_render(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(7);
-    let img = match c
+    let refs = match c
         .render(
             comfy::RenderOpts {
                 prompt,
@@ -465,23 +529,55 @@ async fn direct_render(
                 height: h,
                 steps,
                 seed,
+                n,
             },
             |p| send(UiMsg::Status(p)),
         )
         .await
     {
-        Ok(i) => i,
+        Ok(r) => r,
         Err(e) => {
             send(UiMsg::Error(format!("render: {e:#}")));
             return;
         }
     };
-    match c.download(&img).await {
-        Ok(bytes) => send(UiMsg::Image {
-            label: format!("{prompt} ({seed})"),
-            bytes,
-        }),
-        Err(e) => send(UiMsg::Error(format!("download: {e:#}"))),
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = std::path::PathBuf::from(format!("{home}/images/generated"));
+    for (i, img) in refs.iter().enumerate() {
+        let generation = Generation {
+            prompt: prompt.to_string(),
+            negative: "blurry, watermark, text, deformed".to_string(),
+            ckpt: comfy::DEFAULT_CKPT.to_string(),
+            width: w,
+            height: h,
+            steps,
+            cfg: 1.5,
+            sampler: "euler".to_string(),
+            scheduler: "normal".to_string(),
+            seed,
+            n: refs.len() as u32,
+            index: i as u32,
+            software: format!("ccti {}", env!("CARGO_PKG_VERSION")),
+            created_unix: ts,
+        };
+        match c.download(img).await {
+            Ok(bytes) => {
+                let stem = format!("ccti_{ts}_{i}");
+                match prov::store_rendered(&dir, &stem, &bytes, &generation) {
+                    Ok((png_path, _)) => send(UiMsg::Image {
+                        label: png_path.display().to_string(),
+                        bytes,
+                        generation: Some(generation),
+                    }),
+                    Err(e) => send(UiMsg::Error(format!("save: {e:#}"))),
+                }
+            }
+            Err(e) => send(UiMsg::Error(format!("download: {e:#}"))),
+        }
     }
     send(UiMsg::Status("ready".into()));
 }
@@ -510,7 +606,13 @@ async fn watch_renders(tx: mpsc::UnboundedSender<UiMsg>) {
                 if let Ok(bytes) = tokio::fs::read(ent.path()).await
                     && image::load_from_memory(&bytes).is_ok()
                 {
-                    let _ = tx.send(UiMsg::Image { label: name, bytes });
+                    let json_path = ent.path().with_extension("json");
+                    let generation = Generation::load_sidecar(&json_path).ok();
+                    let _ = tx.send(UiMsg::Image {
+                        label: name,
+                        bytes,
+                        generation,
+                    });
                 }
             }
         }
@@ -567,8 +669,8 @@ mod tests {
         let mut app = test_app();
         app.step_history(1); // empty: no panic, no move
         assert_eq!(app.gidx, 0);
-        app.push_image("a".into(), test_png());
-        app.push_image("b".into(), test_png());
+        app.push_image("a".into(), test_png(), None);
+        app.push_image("b".into(), test_png(), None);
         assert_eq!(app.gidx, 1);
         app.step_history(1);
         assert_eq!(app.gidx, 0);
@@ -577,15 +679,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_render_plain_prompt_keeps_defaults() {
-        assert_eq!(parse_render("a fox"), ("a fox".to_string(), 768, 768, 10));
+    fn parse_render_plain_prompt_keeps_fast_defaults() {
+        assert_eq!(parse_render("a fox"), ("a fox".to_string(), 512, 512, 8, 1));
     }
 
     #[test]
     fn parse_render_honours_flags() {
         assert_eq!(
-            parse_render("a fox --w 1024 --h 512 --steps 20"),
-            ("a fox".to_string(), 1024, 512, 20)
+            parse_render("a fox --w 1024 --h 512 --steps 20 --n 3"),
+            ("a fox".to_string(), 1024, 512, 20, 3)
         );
     }
 
@@ -593,8 +695,45 @@ mod tests {
     fn parse_render_ignores_broken_flag_values() {
         assert_eq!(
             parse_render("x --steps abc"),
-            ("x".to_string(), 768, 768, 10)
+            ("x".to_string(), 512, 512, 8, 1)
         );
-        assert_eq!(parse_render("--w 100"), ("".to_string(), 100, 768, 10));
+        assert_eq!(parse_render("--w 100"), ("".to_string(), 100, 512, 8, 1));
+    }
+
+    #[test]
+    fn parse_render_clamps_batch() {
+        assert_eq!(parse_render("x --n 99"), ("x".to_string(), 512, 512, 8, 4));
+        assert_eq!(parse_render("x --n 0"), ("x".to_string(), 512, 512, 8, 1));
+    }
+
+    #[test]
+    fn provenance_panel_shows_prompt_model_and_run() {
+        let generation = Generation {
+            prompt: "a fox in snow".into(),
+            negative: "blurry".into(),
+            ckpt: "some/dir/model.safetensors".into(),
+            width: 512,
+            height: 512,
+            steps: 8,
+            cfg: 1.5,
+            sampler: "euler".into(),
+            scheduler: "normal".into(),
+            seed: 7,
+            n: 2,
+            index: 0,
+            software: "ccti 0.1.2".into(),
+            created_unix: 1,
+        };
+        let lines = prov_lines(Some(&generation));
+        let all = lines.join("\n");
+        assert!(all.contains("a fox in snow"), "prompt missing:\n{all}");
+        assert!(all.contains("model.safetensors"), "model missing:\n{all}");
+        assert!(all.contains("512x512"), "size missing:\n{all}");
+        assert!(all.contains('7'), "seed missing:\n{all}");
+        assert_eq!(
+            prov_lines(None),
+            vec!["no provenance recorded (pre-0.1.2 render)".to_string()]
+        );
+        assert_eq!(short_ckpt("a/b/c.safetensors"), "c.safetensors");
     }
 }

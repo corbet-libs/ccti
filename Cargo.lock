@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "ccti"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -339,6 +339,7 @@ dependencies = [
  "crossterm",
  "futures",
  "image",
+ "png",
  "ratatui",
  "ratatui-image",
  "reqwest",

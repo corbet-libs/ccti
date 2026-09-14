@@ -4,6 +4,7 @@
 mod agent;
 mod comfy;
 mod mcp;
+mod prov;
 mod ui;
 
 use std::time::Duration;
@@ -47,13 +48,17 @@ async fn main() -> Result<()> {
         });
         let w: u32 = flag(&args, "--w")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(768);
+            .unwrap_or(512);
         let h: u32 = flag(&args, "--h")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(768);
+            .unwrap_or(512);
         let steps: u32 = flag(&args, "--steps")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
+            .unwrap_or(8);
+        let n: u32 = flag(&args, "--n")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 4);
         let c = comfy::Client::new(&base)?;
         c.wait_ready(Duration::from_secs(420), |p| eprintln!("{p}"))
             .await?;
@@ -61,7 +66,7 @@ async fn main() -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(7);
-        let img = c
+        let refs = c
             .render(
                 comfy::RenderOpts {
                     prompt: &prompt,
@@ -70,13 +75,53 @@ async fn main() -> Result<()> {
                     height: h,
                     steps,
                     seed,
+                    n,
                 },
                 |p| eprintln!("{p}"),
             )
             .await?;
-        let bytes = c.download(&img).await?;
-        tokio::fs::write(&out, &bytes).await?;
-        println!("saved: {out}");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let dir = std::path::PathBuf::from(format!("{home}/images/generated"));
+        for (i, img) in refs.iter().enumerate() {
+            let bytes = c.download(img).await?;
+            let generation = prov::Generation {
+                prompt: prompt.clone(),
+                negative: "blurry, watermark, text, deformed".to_string(),
+                ckpt: comfy::DEFAULT_CKPT.to_string(),
+                width: w,
+                height: h,
+                steps,
+                cfg: 1.5,
+                sampler: "euler".to_string(),
+                scheduler: "normal".to_string(),
+                seed,
+                n: refs.len() as u32,
+                index: i as u32,
+                software: format!("ccti {}", env!("CARGO_PKG_VERSION")),
+                created_unix: ts,
+            };
+            // --out names the first image; batch siblings get suffixed names.
+            if i == 0 && refs.len() == 1 {
+                let raw = std::path::PathBuf::from(&out);
+                let stem = raw
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("ccti_headless")
+                    .to_string();
+                let parent = raw.parent().map(|p| p.to_path_buf()).unwrap_or(dir.clone());
+                let (png_path, json_path) =
+                    prov::store_rendered(&parent, &stem, &bytes, &generation)?;
+                println!("saved: {} (+ {})", png_path.display(), json_path.display());
+            } else {
+                let stem = format!("ccti_{ts}_{i}");
+                let (png_path, _) = prov::store_rendered(&dir, &stem, &bytes, &generation)?;
+                println!("saved: {}", png_path.display());
+            }
+        }
         return Ok(());
     }
     ui::run().await
@@ -87,7 +132,7 @@ fn help_text() -> String {
         "ccti {} — ComfyUI TUI: agentic image chat with inline terminal rendering\n\n\
          Usage:\n  \
            ccti                              Start the TUI (needs a real terminal)\n  \
-           ccti --render PROMPT [--out FILE] [--w N --h N --steps N]\n  \
+           ccti --render PROMPT [--out FILE] [--w N --h N --steps N --n 1-4]\n  \
            ccti --models                     List ComfyUI checkpoints\n  \
            ccti --mcp                        MCP stdio server (render_image tool)\n  \
            ccti --help | --version",

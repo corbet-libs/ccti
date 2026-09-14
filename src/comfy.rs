@@ -15,6 +15,8 @@ pub struct RenderOpts<'a> {
     pub height: u32,
     pub steps: u32,
     pub seed: u64,
+    /// Batch size: how many images this render produces.
+    pub n: u32,
 }
 /// Reference to a finished image on the ComfyUI server.
 pub struct ImageRef {
@@ -88,12 +90,12 @@ impl Client {
         Ok(names)
     }
 
-    /// Submit txt2img and wait for the finished image reference.
+    /// Submit txt2img and wait for the finished image references (batch).
     pub async fn render(
         &self,
         opts: RenderOpts<'_>,
         mut progress: impl FnMut(String),
-    ) -> Result<ImageRef> {
+    ) -> Result<Vec<ImageRef>> {
         let RenderOpts {
             prompt,
             ckpt,
@@ -101,8 +103,9 @@ impl Client {
             height,
             steps,
             seed,
+            n,
         } = opts;
-        let wf = build_workflow(prompt, ckpt, width, height, steps, seed);
+        let wf = build_workflow(prompt, ckpt, width, height, steps, seed, n);
         let pid: String = self
             .http
             .post(format!("{}/prompt", self.base))
@@ -133,18 +136,22 @@ impl Client {
                 Ok(r) => r.json().await.unwrap_or(Value::Null),
                 Err(_) => continue,
             };
-            if let Some(img) = h
+            if let Some(images) = h
                 .get(&pid)
                 .and_then(|p| p.get("outputs"))
                 .and_then(|o| o.get("7"))
                 .and_then(|n| n.get("images"))
-                .and_then(|i| i.get(0))
+                .and_then(|i| i.as_array())
+                .filter(|a| !a.is_empty())
             {
-                return Ok(ImageRef {
-                    filename: img["filename"].as_str().unwrap_or("").to_string(),
-                    subfolder: img["subfolder"].as_str().unwrap_or("").to_string(),
-                    typ: img["type"].as_str().unwrap_or("output").to_string(),
-                });
+                return Ok(images
+                    .iter()
+                    .map(|img| ImageRef {
+                        filename: img["filename"].as_str().unwrap_or("").to_string(),
+                        subfolder: img["subfolder"].as_str().unwrap_or("").to_string(),
+                        typ: img["type"].as_str().unwrap_or("output").to_string(),
+                    })
+                    .collect());
             }
         }
     }
@@ -190,6 +197,7 @@ fn build_workflow(
     height: u32,
     steps: u32,
     seed: u64,
+    n: u32,
 ) -> Value {
     json!({
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
@@ -197,7 +205,7 @@ fn build_workflow(
         "3": {"class_type": "CLIPTextEncode",
               "inputs": {"text": "blurry, watermark, text, deformed", "clip": ["1", 1]}},
         "4": {"class_type": "EmptyLatentImage",
-              "inputs": {"width": width, "height": height, "batch_size": 1}},
+              "inputs": {"width": width, "height": height, "batch_size": n}},
         "5": {"class_type": "KSampler",
               "inputs": {"model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
                          "latent_image": ["4", 0], "seed": seed, "steps": steps, "cfg": 1.5,
@@ -225,7 +233,7 @@ mod tests {
 
     #[test]
     fn workflow_wires_prompt_ckpt_geometry_and_sampler() {
-        let wf = build_workflow("a fox", "my.safetensors", 512, 1024, 7, 42);
+        let wf = build_workflow("a fox", "my.safetensors", 512, 1024, 7, 42, 3);
         assert_eq!(wf["1"]["inputs"]["ckpt_name"], "my.safetensors");
         assert_eq!(wf["2"]["inputs"]["text"], "a fox");
         assert_eq!(wf["4"]["inputs"]["width"], 512);

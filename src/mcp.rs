@@ -7,10 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::comfy::{self, Client};
+use crate::prov::{self, Generation};
 
-const TOOL_DESC: &str = "Render an image with ComfyUI (SDXL txt2img). \
-Handles the GPU cold start itself; may take minutes. Returns the saved path \
-plus a downscaled preview image.";
+const TOOL_DESC: &str = "Render images with ComfyUI (SDXL txt2img). \
+Defaults are tuned for fast iteration: 512x512, 8 steps, 1 image. \
+Use n (up to 4) for variants, larger sizes/steps for finals. \
+Handles the GPU cold start itself; may take minutes. Returns saved paths \
+(with generation metadata embedded plus JSON sidecars) and a preview of the \
+first image. If attached images are not visible to you, Read the saved PNG \
+file(s) to view them, then iterate: adjust prompt, size, steps or seed and \
+call render_image again.";
 
 /// Serve MCP on stdin/stdout until EOF.
 pub async fn serve() -> Result<()> {
@@ -80,9 +86,10 @@ fn tool_def() -> Value {
             "required": ["prompt"],
             "properties": {
                 "prompt": {"type": "string", "description": "Image prompt, English, descriptive"},
-                "width": {"type": "integer", "default": 768},
-                "height": {"type": "integer", "default": 768},
-                "steps": {"type": "integer", "default": 10},
+                "width": {"type": "integer", "default": 512},
+                "height": {"type": "integer", "default": 512},
+                "steps": {"type": "integer", "default": 8},
+                "n": {"type": "integer", "default": 1, "description": "How many variants (1-4)"},
                 "seed": {"type": "integer"},
                 "ckpt": {"type": "string", "description": "Checkpoint override"}
             }
@@ -104,9 +111,10 @@ async fn call_tool(params: &Value) -> Result<Value, Value> {
         .get("prompt")
         .and_then(|p| p.as_str())
         .ok_or_else(|| err(-32602, "prompt is required"))?;
-    let width = a.get("width").and_then(|v| v.as_u64()).unwrap_or(768) as u32;
-    let height = a.get("height").and_then(|v| v.as_u64()).unwrap_or(768) as u32;
-    let steps = a.get("steps").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+    let width = a.get("width").and_then(|v| v.as_u64()).unwrap_or(512) as u32;
+    let height = a.get("height").and_then(|v| v.as_u64()).unwrap_or(512) as u32;
+    let steps = a.get("steps").and_then(|v| v.as_u64()).unwrap_or(8) as u32;
+    let n = a.get("n").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4) as u32;
     let seed = a.get("seed").and_then(|v| v.as_u64()).unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -120,7 +128,18 @@ async fn call_tool(params: &Value) -> Result<Value, Value> {
         .to_string();
 
     let base = std::env::var("CCTI_COMFY_URL").unwrap_or_else(|_| comfy::DEFAULT_BASE.into());
-    let out = match render_and_store(&base, prompt, &ckpt, width, height, steps, seed).await {
+    let out = match render_and_store(RenderJob {
+        base: &base,
+        prompt,
+        ckpt: &ckpt,
+        width,
+        height,
+        steps,
+        seed,
+        n,
+    })
+    .await
+    {
         Ok(o) => o,
         Err(e) => {
             return Ok(json!({
@@ -142,18 +161,36 @@ struct RenderOut {
     preview_b64: String,
 }
 
-async fn render_and_store(
-    base: &str,
-    prompt: &str,
-    ckpt: &str,
+fn images_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(format!("{home}/images/generated"))
+}
+
+struct RenderJob<'a> {
+    base: &'a str,
+    prompt: &'a str,
+    ckpt: &'a str,
     width: u32,
     height: u32,
     steps: u32,
     seed: u64,
-) -> Result<RenderOut> {
+    n: u32,
+}
+
+async fn render_and_store(job: RenderJob<'_>) -> Result<RenderOut> {
+    let RenderJob {
+        base,
+        prompt,
+        ckpt,
+        width,
+        height,
+        steps,
+        seed,
+        n,
+    } = job;
     let client = Client::new(base)?;
     client.wait_ready(Duration::from_secs(420), |_| {}).await?;
-    let img = client
+    let refs = client
         .render(
             comfy::RenderOpts {
                 prompt,
@@ -162,19 +199,47 @@ async fn render_and_store(
                 height,
                 steps,
                 seed,
+                n,
             },
             |_| {},
         )
         .await?;
-    let bytes = client.download(&img).await?;
-
     let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let path = format!("{home}/images/generated/ccti_{ts}.png");
-    tokio::fs::write(&path, &bytes).await?;
+    let dir = images_dir();
+    let mut paths = Vec::new();
+    let mut first_bytes: Option<Vec<u8>> = None;
+    for (i, img) in refs.iter().enumerate() {
+        let bytes = client.download(img).await?;
+        let generation = Generation {
+            prompt: prompt.to_string(),
+            negative: "blurry, watermark, text, deformed".to_string(),
+            ckpt: ckpt.to_string(),
+            width,
+            height,
+            steps,
+            cfg: 1.5,
+            sampler: "euler".to_string(),
+            scheduler: "normal".to_string(),
+            seed,
+            n: refs.len() as u32,
+            index: i as u32,
+            software: format!("ccti {}", env!("CARGO_PKG_VERSION")),
+            created_unix: ts,
+        };
+        let stem = format!("ccti_{ts}_{i}");
+        let (png_path, _) = prov::store_rendered(&dir, &stem, &bytes, &generation)?;
+        paths.push(png_path.display().to_string());
+        if first_bytes.is_none() {
+            first_bytes = Some(bytes);
+        }
+    }
+    if paths.is_empty() {
+        anyhow::bail!("ComfyUI returned no images");
+    }
 
-    // Downscaled preview so the calling agent can actually see the result.
+    // Downscaled preview so callers with vision can see the result at a glance.
     let preview_b64 = tokio::task::spawn_blocking(move || -> Result<String> {
+        let bytes = first_bytes.unwrap_or_default();
         let dyn_img = image::load_from_memory(&bytes)?;
         let small = dyn_img.thumbnail(512, 512);
         let mut buf = Vec::new();
@@ -191,7 +256,11 @@ async fn render_and_store(
 
     Ok(RenderOut {
         summary: format!(
-            "rendered {width}x{height} in {steps} steps (seed {seed}, {ckpt}), saved to {path}"
+            "rendered {} image(s) {width}x{height} in {steps} steps (seed {seed}, {ckpt}): {}. \
+             Provenance is embedded plus sidecar JSON. If attached images are not visible to you, \
+             Read the saved PNG file(s) to view them, then iterate.",
+            paths.len(),
+            paths.join(", "),
         ),
         preview_b64,
     })

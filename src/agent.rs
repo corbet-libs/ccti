@@ -31,9 +31,13 @@ fn decide(request: &ccht::acp::RequestPermissionRequest) -> RequestPermissionOut
 }
 
 const SYSTEM: &str = "You are the ccti image assistant. You have an MCP tool \
-render_image(prompt, width, height, steps, seed) that renders with ComfyUI. \
-When the user asks for an image, call render_image (default 768x768, 10 steps) \
-and describe the result briefly. The cold start is handled inside the tool; \
+render_image(prompt, width, height, steps, n, seed) that renders with ComfyUI. \
+Defaults are tuned for fast iteration (512x512, 8 steps, 1 image); use n (up \
+to 4) for variants and larger sizes/steps for finals. Every render saves PNGs \
+(with embedded provenance plus JSON sidecars) and returns their paths plus a \
+preview image. If attached images are not visible to you, Read the saved PNG \
+file(s) to view them. Always look at the result (preview or file), describe \
+it briefly, and offer tweaks. The cold start is handled inside the tool; \
 just wait for it. Answer in the user's language.";
 
 enum Cmd {
