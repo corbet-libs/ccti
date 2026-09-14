@@ -1,0 +1,7 @@
+schema = 1
+project = "ccti"
+
+# Select affected checks explicitly; no implicit full language/platform matrix.
+[checks.rust]
+kind = "cargo"
+actions = ["fmt", "test", "clippy"]

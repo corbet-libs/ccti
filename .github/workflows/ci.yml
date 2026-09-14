@@ -1,0 +1,154 @@
+name: Manual selected checks
+
+# Public manual fallback. The reviewed dispatcher route (.github/workflows/ccid.yml,
+# same .ci/ccid.toml selectors) is the primary gate; this workflow runs the same
+# selectors by hand for public source consumers. Crow handles inputs that must
+# remain on owned infrastructure.
+on:
+  workflow_dispatch:
+    inputs:
+      checks:
+        description: Comma-separated .ci/ccid.toml selectors, in execution order
+        type: string
+        required: true
+        default: rust
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      REQUESTED_CHECKS: ${{ inputs.checks }}
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_BUILD_JOBS: "2"
+      RUST_TEST_THREADS: "2"
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CI_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+    steps:
+      - name: Check out the dispatched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Validate selection and record source identity
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ARTIFACT_ROOT="$RUNNER_TEMP/release-artifacts"
+          echo "ARTIFACT_ROOT=$ARTIFACT_ROOT" >> "$GITHUB_ENV"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_sha256=$(git archive --format=tar HEAD | sha256sum | cut -d ' ' -f 1)
+          export SOURCE_SHA256="$source_sha256"
+          python3 - <<'PYTHON'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          selectors = [part.strip() for part in os.environ['REQUESTED_CHECKS'].split(',')]
+          config = tomllib.loads(Path('.ci/ccid.toml').read_text())
+          package = tomllib.loads(Path('Cargo.toml').read_text())['package']
+          if not selectors or any(not part or part not in config['checks'] for part in selectors):
+              raise SystemExit('Select existing .ci/ccid.toml checks; empty selectors are invalid')
+          if len(set(selectors)) != len(selectors):
+              raise SystemExit('Each check may be selected only once')
+          minimum = package['rust-version']
+          if not re.fullmatch(r'\d+\.\d+(?:\.\d+)?', minimum):
+              raise SystemExit('Cargo rust-version must declare a numeric minimum')
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write('CI_COMMIT_SHA=' + os.environ['GITHUB_SHA'] + '\n')
+              environment.write('SOURCE_SHA256=' + os.environ['SOURCE_SHA256'] + '\n')
+              environment.write('SELECTED_CHECKS=' + ','.join(selectors) + '\n')
+          inputs = [Path('Cargo.toml'), Path('Cargo.lock')]
+          directory = Path(os.environ['ARTIFACT_ROOT'])
+          directory.mkdir(parents=True, exist_ok=True)
+          receipt = {
+              'schema': 1, 'provider': 'github-actions', 'commit': os.environ['GITHUB_SHA'],
+              'source_sha256': os.environ['SOURCE_SHA256'], 'checks': selectors,
+              'workflow_sha256': hashlib.sha256(Path('.github/workflows/ci.yml').read_bytes()).hexdigest(),
+              'dependency_inputs': {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inputs if path.is_file()},
+              'status': 'prepared',
+              'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          (directory / 'hosted-run.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PYTHON
+
+      - name: Set up current stable Rust on the hosted runner
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Reuse Rust dependencies
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          shared-key: hosted-selected-linux
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Record the actual hosted environment
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import subprocess
+          path = Path(os.environ['ARTIFACT_ROOT']) / 'hosted-run.json'
+          receipt = json.loads(path.read_text())
+          commands = [['rustup', 'run', 'stable', tool, '--version'] for tool in ('rustc', 'cargo')]
+          receipt['platform'] = platform.platform()
+          receipt['tools'] = {' '.join(command): subprocess.check_output(command, text=True).strip() for command in commands}
+          path.write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps(receipt, indent=2))
+          PYTHON
+
+      - name: Run the selected repository checks
+        id: checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a selectors <<< "$SELECTED_CHECKS"
+          for selector in "${selectors[@]}"; do
+            echo "::group::$selector"
+            case "$selector" in
+              rust)
+                cargo fmt --all -- --check
+                cargo test --locked
+                cargo clippy --all-targets --locked -- -D warnings
+                ;;
+              *) echo "unknown selector: $selector" >&2; exit 2 ;;
+            esac
+            echo "::endgroup::"
+          done
+
+      - name: Record the check result
+        if: always() && steps.plan.outcome == 'success'
+        env:
+          CHECK_OUTCOME: ${{ steps.checks.outcome }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ['ARTIFACT_ROOT']) / 'hosted-run.json'
+          receipt = json.loads(path.read_text())
+          receipt['status'] = os.environ['CHECK_OUTCOME']
+          path.write_text(json.dumps(receipt, indent=2) + '\n')
+          PYTHON
+
+      - name: Retain exact packages and check receipts
+        if: always() && steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: selected-checks-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-artifacts
+          if-no-files-found: error
+          retention-days: 14

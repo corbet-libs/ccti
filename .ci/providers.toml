@@ -1,0 +1,16 @@
+schema = 1
+
+[github]
+repository = "corbet-labs/ccti"
+workflow = "ccid.yml"
+workflow_sha256 = "676927e79f604008572aadfe442f9fe6a5f694f66fbed7cd45c9c40b66e263e2"
+checks = ["rust"]
+platform = "linux-x86_64"
+secret_free = true
+free_eligible = true
+tool_revision = "85e316579ea938c42a4e45d42cb3ac94aa2d9328"
+tool_bootstrap_workflow = "bootstrap.yml"
+tool_bootstrap_sha256 = "33816c3688229e19361520e4a01d5ec1688d52c12cd0f7f0e508fe5c52b183d8"
+
+[dependencies]
+files = ["Cargo.lock", "Cargo.toml"]

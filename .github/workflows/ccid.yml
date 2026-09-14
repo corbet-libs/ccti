@@ -1,0 +1,76 @@
+name: ccid hosted Linux check
+
+run-name: ccid/${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full ccti commit to check
+        required: true
+        type: string
+      checks:
+        description: Exact ccid selector list
+        required: true
+        type: string
+      request_id:
+        description: Crow correlation identifier
+        required: true
+        type: string
+      dependency_snapshot:
+        description: Canonical dependency input digest
+        required: true
+        type: string
+      tool_revision:
+        description: Exact ccid source revision
+        required: true
+        type: string
+      tool_run_id:
+        description: Completed ccid bootstrap run ID
+        required: true
+        type: string
+      tool_asset_id:
+        description: Exact ccid release asset ID
+        required: true
+        type: string
+      tool_archive_sha256:
+        description: SHA-256 of the exact ccid release ZIP
+        required: true
+        type: string
+      tool_binary_sha256:
+        description: SHA-256 of the ccid binary
+        required: true
+        type: string
+      manifest_sha256:
+        description: SHA-256 of .ci/ccid.toml
+        required: true
+        type: string
+      config_sha256:
+        description: SHA-256 of .ci/providers.toml
+        required: true
+        type: string
+      tool_bootstrap_sha256:
+        description: SHA-256 of the producing bootstrap workflow bytes
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  ccid:
+    uses: corbet-labs/ccid/.github/workflows/reusable-check.yml@500c9b4af118e8f8d85b4bdc4980c37890b07b8a
+    with:
+      source_commit: ${{ inputs.source_commit }}
+      checks: ${{ inputs.checks }}
+      request_id: ${{ inputs.request_id }}
+      dependency_snapshot: ${{ inputs.dependency_snapshot }}
+      tool_revision: ${{ inputs.tool_revision }}
+      tool_run_id: ${{ inputs.tool_run_id }}
+      tool_asset_id: ${{ inputs.tool_asset_id }}
+      tool_archive_sha256: ${{ inputs.tool_archive_sha256 }}
+      tool_binary_sha256: ${{ inputs.tool_binary_sha256 }}
+      manifest_sha256: ${{ inputs.manifest_sha256 }}
+      config_sha256: ${{ inputs.config_sha256 }}
+      tool_bootstrap_sha256: ${{ inputs.tool_bootstrap_sha256 }}
