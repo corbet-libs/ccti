@@ -284,13 +284,72 @@ fn short_ckpt(ckpt: &str) -> String {
 fn split_long(text: &str) -> Vec<String> {
     text.lines()
         .map(|l| {
-            if l.len() <= 2000 {
+            if l.chars().count() <= 2000 {
                 l.to_string()
             } else {
-                format!("{}…", &l[..2000])
+                format!("{}…", l.chars().take(1999).collect::<String>())
             }
         })
         .collect()
+}
+
+/// Word-wrap by display-cell width (CJK counts double, umlauts single).
+/// Never panics on boundaries; overlong words are hard-split by cells.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        let mut cur_w = 0;
+        for word in line.split_whitespace() {
+            let ww = word.width();
+            if ww > width {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                let mut chunk = String::new();
+                let mut cw = 0;
+                for ch in word.chars() {
+                    let chw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if cw + chw > width && !chunk.is_empty() {
+                        out.push(std::mem::take(&mut chunk));
+                        cw = 0;
+                    }
+                    chunk.push(ch);
+                    cw += chw;
+                }
+                if !chunk.is_empty() {
+                    out.push(chunk);
+                }
+                continue;
+            }
+            if cur.is_empty() {
+                cur.push_str(word);
+                cur_w = ww;
+            } else if cur_w + 1 + ww <= width {
+                cur.push(' ');
+                cur.push_str(word);
+                cur_w += 1 + ww;
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur.push_str(word);
+                cur_w = ww;
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -361,15 +420,22 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
             "err" => Color::Red,
             _ => Color::DarkGray,
         };
-        for (i, chunk) in text.chars().collect::<Vec<_>>().chunks(w).enumerate() {
-            let s: String = chunk.iter().collect();
-            if i == 0 {
-                lines.push(RLine::from(vec![
-                    Span::styled(format!("[{role}] "), Style::default().fg(color)),
-                    Span::raw(s),
-                ]));
-            } else {
-                lines.push(RLine::from(format!("      {s}")));
+        let prefix = format!("[{role}] ");
+        let mut first_visual = true;
+        for phys in split_long(text) {
+            let avail = w
+                .saturating_sub(if first_visual { prefix.len() } else { 6 })
+                .max(10);
+            for visual in wrap_text(&phys, avail) {
+                if first_visual {
+                    lines.push(RLine::from(vec![
+                        Span::styled(prefix.clone(), Style::default().fg(color)),
+                        Span::raw(visual),
+                    ]));
+                    first_visual = false;
+                } else {
+                    lines.push(RLine::from(format!("      {visual}")));
+                }
             }
         }
     }
@@ -704,6 +770,90 @@ mod tests {
     fn parse_render_clamps_batch() {
         assert_eq!(parse_render("x --n 99"), ("x".to_string(), 512, 512, 8, 4));
         assert_eq!(parse_render("x --n 0"), ("x".to_string(), 512, 512, 8, 1));
+    }
+
+    #[test]
+    fn wrap_breaks_on_words_not_mid_word() {
+        assert_eq!(
+            wrap_text("hello world foo", 8),
+            vec!["hello", "world", "foo"]
+        );
+        assert_eq!(wrap_text("hello world", 11), vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_counts_cells_not_chars() {
+        // Umlauts are one cell; CJK two.
+        assert_eq!(wrap_text("Größe ändern", 7), vec!["Größe", "ändern"]);
+        assert_eq!(wrap_text("日本語テスト", 6), vec!["日本語", "テスト"]);
+    }
+
+    #[test]
+    fn wrap_splits_overlong_words_by_cells() {
+        assert_eq!(wrap_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn split_long_never_panics_on_multibyte() {
+        let s = "ä".repeat(3000);
+        let out = split_long(&s);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].chars().count() <= 2000);
+    }
+
+    #[test]
+    fn render_wraps_long_german_prompt_inside_provenance_box() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = test_app();
+        app.cells = Size::new(90, 20);
+        app.chat.push((
+            "agent".into(),
+            "Größe prüfen: ein äußerst langes deutsches Wort wie Donaudampfschifffahrtsgesellschaft und 日本語混じり".into(),
+        ));
+        let generation = Generation {
+            prompt: "Eine äußerst lange deutsche Beschreibung mit Umlauten äöü und scharfem ß, die auf schmaler Breite korrekt umbrechen muss ohne zu panicen".into(),
+            negative: "unscharf".into(),
+            ckpt: "model.safetensors".into(),
+            width: 512,
+            height: 512,
+            steps: 8,
+            cfg: 1.5,
+            sampler: "euler".into(),
+            scheduler: "normal".into(),
+            seed: 1,
+            n: 1,
+            index: 0,
+            software: "ccti".into(),
+            created_unix: 1,
+        };
+        app.push_image("test".into(), test_png(), Some(generation));
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..40 {
+            let mut line = String::new();
+            for x in 0..120 {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            // No visual line may exceed the terminal width in cells.
+            assert!(
+                line.chars().count() <= 120,
+                "overflow on row {y}: {} cells",
+                line.chars().count()
+            );
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+        // Prompt survives wrapping (reflowed, so compare whitespace-collapsed).
+        let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("Eine äußerst lange deutsche Beschreibung"),
+            "prompt lost in render"
+        );
+        assert!(flat.contains("Größe prüfen"), "chat lost in render");
+        assert!(flat.contains("provenance"), "panel title lost");
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 — 2026-09-15
+
+- Correct line wrapping: word-aware, display-cell based (CJK counts double,
+  umlauts single), no more mid-word breaks; fixes a panic on multibyte text
+  past the length cap.
+
 ## 0.1.1 — 2026-09-14
 
 `--help`/`-h` and `--version`/`-V` print usage instead of dropping into the
