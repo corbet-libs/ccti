@@ -73,10 +73,15 @@ pub async fn run() -> Result<()> {
     res
 }
 
+/// Wide (side-by-side) layout threshold. MUST match `split` below.
+fn is_wide(area: Rect) -> bool {
+    area.width >= 100
+}
+
 /// Split main area into (image, chat). Wide screens go 80/20 side by side,
 /// narrow ones stack image over chat.
 fn split(area: Rect) -> (Rect, Rect) {
-    if area.width >= 100 {
+    if is_wide(area) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(80), Constraint::Percentage(20)])
@@ -89,6 +94,47 @@ fn split(area: Rect) -> (Rect, Rect) {
             .split(area);
         (rows[0], rows[1])
     }
+}
+
+/// Shared seams are drawn exactly once: the upper/left box owns the edge,
+/// the neighbour drops it. Titles move to the remaining outer edge so no
+/// box ends up title-less.
+fn pic_block(title: String) -> Block<'static> {
+    Block::default()
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .title(title)
+}
+
+fn prov_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .title_bottom("provenance")
+}
+
+fn chat_block(wide: bool) -> Block<'static> {
+    // Wide: seam is vertical, drop LEFT. Narrow (stacked): seam is
+    // horizontal against provenance's bottom edge, drop TOP instead.
+    let borders = if wide {
+        Borders::TOP | Borders::RIGHT | Borders::BOTTOM
+    } else {
+        Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
+    };
+    let block = Block::default().borders(borders);
+    if wide {
+        block.title("chat")
+    } else {
+        block.title_bottom("chat")
+    }
+}
+
+fn input_block(wide: bool) -> Block<'static> {
+    // Same vertical seam rule as the chat box above it.
+    let borders = if wide {
+        Borders::RIGHT | Borders::BOTTOM
+    } else {
+        Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
+    };
+    Block::default().borders(borders)
 }
 
 fn gallery_cells(area: Rect) -> Size {
@@ -354,6 +400,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = f.area();
+    let wide = is_wide(area);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -378,10 +425,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
             item.label
         )
     };
-    f.render_widget(
-        Block::default().borders(Borders::ALL).title(title),
-        pic_rect,
-    );
+    f.render_widget(pic_block(title), pic_rect);
     if let Some(item) = app.gallery.get(app.gidx)
         && let Some(proto) = &item.proto
     {
@@ -400,7 +444,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     );
     f.render_widget(
         Paragraph::new(prov.join("\n"))
-            .block(Block::default().borders(Borders::ALL).title("provenance"))
+            .block(prov_block())
             .wrap(Wrap { trim: true }),
         prov_rect,
     );
@@ -442,7 +486,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let visible = cols[0].height.saturating_sub(2) as usize;
     let skip = lines.len().saturating_sub(visible.max(1));
     let msg = Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>())
-        .block(Block::default().borders(Borders::ALL).title("chat"))
+        .block(chat_block(wide))
         .wrap(Wrap { trim: false });
     f.render_widget(msg, cols[0]);
     let prompt = if app.busy {
@@ -450,8 +494,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } else {
         ">"
     };
-    let input = Paragraph::new(format!("{prompt} {}", app.input))
-        .block(Block::default().borders(Borders::ALL));
+    let input = Paragraph::new(format!("{prompt} {}", app.input)).block(input_block(wide));
     f.render_widget(input, cols[1]);
 
     let status = Paragraph::new(app.status.clone()).style(Style::default().fg(Color::DarkGray));
@@ -843,6 +886,11 @@ mod tests {
                 "overflow on row {y}: {} cells",
                 line.chars().count()
             );
+            // No doubled vertical seams anywhere.
+            assert!(
+                !line.contains("││"),
+                "doubled vertical border on row {y}: {line}"
+            );
             text.push_str(line.trim_end());
             text.push('\n');
         }
@@ -854,6 +902,40 @@ mod tests {
         );
         assert!(flat.contains("Größe prüfen"), "chat lost in render");
         assert!(flat.contains("provenance"), "panel title lost");
+        // Horizontal seam between picture and provenance is a single line:
+        // recompute the layout and check the provenance top row has no ─ run.
+        let full = Rect::new(0, 0, 120, 39);
+        let (img_rect, _) = split(full);
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(8)])
+            .split(img_rect);
+        let seam_y = left[1].y as usize;
+        let mut seam = String::new();
+        for x in 0..120 {
+            seam.push_str(buf[(x, seam_y as u16)].symbol());
+        }
+        let middle: String = seam.chars().skip(1).take(118).collect();
+        assert!(!middle.contains('─'), "doubled horizontal seam: {seam}");
+    }
+
+    #[test]
+    fn narrow_layout_has_no_doubled_seams_either() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = test_app();
+        app.cells = Size::new(60, 12);
+        app.push_image("test".into(), test_png(), None);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 0..24 {
+            let mut line = String::new();
+            for x in 0..80 {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            assert!(!line.contains("││"), "doubled vertical on row {y}");
+        }
     }
 
     #[test]

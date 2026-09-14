@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 — 2026-09-15
+
+- Single-line seams: neighbouring panes share one border instead of drawing
+  two; panel titles move to the remaining outer edge.
+
 ## 0.1.3 — 2026-09-15
 
 - Correct line wrapping: word-aware, display-cell based (CJK counts double,
