@@ -22,6 +22,14 @@ async fn main() -> Result<()> {
     if has("--mcp") {
         return mcp::serve().await;
     }
+    if has("--help") || has("-h") {
+        println!("{}", help_text());
+        return Ok(());
+    }
+    if has("--version") || has("-V") {
+        println!("ccti {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if has("--models") {
         let base = std::env::var("CCTI_COMFY_URL").unwrap_or_else(|_| comfy::DEFAULT_BASE.into());
         let c = comfy::Client::new(&base)?;
@@ -72,4 +80,36 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     ui::run().await
+}
+
+fn help_text() -> String {
+    format!(
+        "ccti {} — ComfyUI TUI: agentic image chat with inline terminal rendering\n\n\
+         Usage:\n  \
+           ccti                              Start the TUI (needs a real terminal)\n  \
+           ccti --render PROMPT [--out FILE] [--w N --h N --steps N]\n  \
+           ccti --models                     List ComfyUI checkpoints\n  \
+           ccti --mcp                        MCP stdio server (render_image tool)\n  \
+           ccti --help | --version",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_mentions_all_modes() {
+        let h = help_text();
+        for token in [
+            "ccti --render",
+            "ccti --models",
+            "ccti --mcp",
+            "ccti --help",
+            "TUI",
+        ] {
+            assert!(h.contains(token), "help missing {token}");
+        }
+    }
 }

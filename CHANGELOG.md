@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1 — 2026-09-14
+
+`--help`/`-h` and `--version`/`-V` print usage instead of dropping into the
+TUI (which needs a real terminal).
+
 ## 0.1.0 — 2026-09-14
 
 Initial release: ComfyUI TUI with image-left/chat-right layout, ccht-backed
