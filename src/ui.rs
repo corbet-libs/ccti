@@ -15,7 +15,7 @@ use futures::StreamExt as _;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin, Rect, Size},
+    layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Style},
     text::{Line as RLine, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -306,25 +306,26 @@ fn apply_menu(app: &mut App) {
         return;
     }
     let ws = app.ws_mut();
-    match menu.kind {
+    let msg = match menu.kind {
         MenuKind::ImageModel => {
             ws.settings.ckpt = item.clone();
-            app.status = format!("image model → {}", short_ckpt(&item));
+            format!("image model → {}", short_ckpt(&item))
         }
         MenuKind::SizePreset => {
-            ws.settings.preset = menu.selected.min(PRESETS.len() - 1);
-            ws.settings.steps = PRESETS[ws.settings.preset].3;
-            app.status = format!("preset → {}", ws.settings.describe());
+            ws.settings.set_preset(menu.selected);
+            format!("preset → {}", ws.settings.describe())
         }
         MenuKind::Steps => {
-            ws.settings.steps = [4u32, 8, 14, 20, 30][menu.selected.min(4)];
-            app.status = format!("steps → {}", ws.settings.steps);
+            let steps = [4u32, 8, 14, 20, 30][menu.selected.min(4)];
+            ws.settings.set_steps(steps as i32);
+            format!("steps → {}", ws.settings.steps)
         }
         MenuKind::Count => {
-            ws.settings.n = (menu.selected as u32 + 1).clamp(1, 4);
-            app.status = format!("count → n={}", ws.settings.n);
+            ws.settings.set_count(menu.selected as u32 + 1);
+            format!("count → n={}", ws.settings.n)
         }
-    }
+    };
+    app.status = msg;
 }
 
 pub async fn run() -> Result<()> {
@@ -375,7 +376,6 @@ struct Areas {
     pic: Rect,
     prov: Rect,
     settings: Rect,
-    models: Rect,
     chat_msgs: Rect,
     chat_input: Rect,
     fkeys: Rect,
@@ -384,34 +384,31 @@ struct Areas {
 
 fn layout_areas(area: Rect, font: FontSize) -> Areas {
     let hgap = hgap_cols(font);
-    let outer = area.inner(Margin::new(hgap, 1));
+    // No outer margin: panes breathe edge to edge, separated only by
+    // pixel-matched gaps (one row vertically, hgap columns horizontally).
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .spacing(1)
-        .split(outer);
+        .split(area);
     let (img_col, chat_col) = split(rows[1], hgap);
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(8),
-            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(7),
         ])
         .spacing(1)
         .split(img_col);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .spacing(1)
         .split(chat_col);
     Areas {
@@ -419,9 +416,8 @@ fn layout_areas(area: Rect, font: FontSize) -> Areas {
         pic: left[0],
         prov: left[1],
         settings: left[2],
-        models: right[0],
-        chat_msgs: right[1],
-        chat_input: right[2],
+        chat_msgs: right[0],
+        chat_input: right[1],
         fkeys: rows[2],
         status: rows[3],
     }
@@ -486,42 +482,17 @@ impl RenderSettings {
         PRESETS[self.preset].0
     }
 
-    fn cycle_preset(&mut self, dir: i32) {
-        let n = PRESETS.len() as i32;
-        self.preset = (self.preset as i32 + dir).rem_euclid(n) as usize;
+    fn set_preset(&mut self, idx: usize) {
+        self.preset = idx.min(PRESETS.len() - 1);
         self.steps = PRESETS[self.preset].3;
     }
 
-    fn adjust_steps(&mut self, delta: i32) {
-        self.steps = (self.steps as i32 + delta).clamp(4, 50) as u32;
+    fn set_steps(&mut self, steps: i32) {
+        self.steps = steps.clamp(4, 50) as u32;
     }
 
-    fn cycle_count(&mut self) {
-        self.n = if self.n >= 4 { 1 } else { self.n + 1 };
-    }
-
-    /// Single-key adjustment, active only while the input line is empty.
-    /// Returns a status line when the key applied, None to keep typing it.
-    fn apply_key(&mut self, c: char) -> Option<String> {
-        match c {
-            '[' => {
-                self.cycle_preset(-1);
-                Some(format!("preset → {}", self.describe()))
-            }
-            ']' => {
-                self.cycle_preset(1);
-                Some(format!("preset → {}", self.describe()))
-            }
-            '-' => {
-                self.adjust_steps(-2);
-                Some(format!("steps → {}", self.steps))
-            }
-            '+' | '=' => {
-                self.adjust_steps(2);
-                Some(format!("steps → {}", self.steps))
-            }
-            _ => None,
-        }
+    fn set_count(&mut self, n: u32) {
+        self.n = n.clamp(1, 4);
     }
 
     fn describe(&self) -> String {
@@ -537,10 +508,10 @@ impl RenderSettings {
     fn lines(&self) -> Vec<String> {
         let (w, h) = self.dims();
         vec![
-            "[ ] preset · -/+ steps · Tab count (empty input only)".to_string(),
+            "F2 model · F3 size · F4 steps · F5 count".to_string(),
             format!("preset: {} · {w}x{h}", self.name()),
             format!("steps: {} · count: n={}", self.steps, self.n),
-            format!("model: {}", short_ckpt(comfy::DEFAULT_CKPT)),
+            format!("model: {}", short_ckpt(&self.ckpt)),
         ]
     }
 }
@@ -756,22 +727,9 @@ async fn run_inner() -> Result<()> {
                                 }
                             }
                             KeyCode::Char(c) => {
-                                // Settings keys act only on an empty input
-                                // line, so typing prompts never misfires.
-                                let applied = if app.input.is_empty() {
-                                    app.ws_mut().settings.apply_key(c)
-                                } else {
-                                    None
-                                };
-                                if let Some(msg) = applied {
-                                    app.status = msg;
-                                } else {
-                                    app.input.push(c);
-                                }
-                            }
-                            KeyCode::Tab if app.input.is_empty() => {
-                                app.ws_mut().settings.cycle_count();
-                                app.status = format!("count → n={}", app.ws().settings.n);
+                                // All typing goes to the input line; render
+                                // settings change only via F-key submenus.
+                                app.input.push(c);
                             }
                             KeyCode::Backspace => { app.input.pop(); }
                             KeyCode::Esc => {
@@ -905,46 +863,81 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Header content line: title left, workspace tabs middle, agent state right.
+/// Single header line: title left, workspace tabs centered in the
+/// middle, per-workspace AIs right. Truncation order on narrow screens:
+/// inactive tabs first, then AI names, never the title or active tab.
 fn header_line(
     width: usize,
     workspaces: &[Workspace],
     active: usize,
-    agent_ok: bool,
+    img_ckpt: &str,
+    chat_model: Option<&str>,
 ) -> RLine<'static> {
     use unicode_width::UnicodeWidthStr;
-    let mut spans = vec![Span::styled(
-        "CCTI - Corbet ComfyUi Terminal Interface",
-        Style::default().fg(Color::Cyan),
-    )];
-    let mut used = "CCTI - Corbet ComfyUi Terminal Interface".width() + 3;
-    spans.push(Span::raw("   "));
-    for (i, ws) in workspaces.iter().enumerate() {
-        let tab = format!("[{} {}]", i + 1, ws.name);
-        if used + tab.width() + 3 > width.saturating_sub(14) && i != active {
-            continue; // squeeze out inactive tabs first on narrow screens
+    const TITLE: &str = "CCTI - Corbet ComfyUi Terminal Interface";
+    let tabs: Vec<String> = workspaces
+        .iter()
+        .enumerate()
+        .map(|(i, ws)| format!("[{} {}]", i + 1, ws.name))
+        .collect();
+    let mut ai = format!(
+        "img: {} · chat: {}",
+        short_ckpt(img_ckpt),
+        chat_model.unwrap_or("default")
+    );
+    // Squeeze policy: drop inactive tabs, then shorten the AI block.
+    // (Explicit index loop: keeps borrowck happy on stable toolchains.)
+    let mut shown: Vec<usize> = (0..tabs.len()).collect();
+    loop {
+        let too_wide = TITLE.width() + 4 + tabs_width(&tabs, &shown) + ai.width() + 4 > width;
+        if !too_wide || shown.len() <= 1 {
+            break;
         }
-        used += tab.width() + 1;
+        let mut drop_at: Option<usize> = None;
+        for (p, &i) in shown.iter().enumerate().rev() {
+            if i != active {
+                drop_at = Some(p);
+                break;
+            }
+        }
+        match drop_at {
+            Some(p) => {
+                shown.remove(p);
+            }
+            None => break,
+        }
+    }
+    while TITLE.width() + 4 + tabs_width(&tabs, &shown) + ai.width() + 4 > width && ai.width() > 12
+    {
+        ai.pop();
+    }
+    let mut spans = vec![Span::styled(TITLE, Style::default().fg(Color::Cyan))];
+    let tabs_w = tabs_width(&tabs, &shown);
+    let used = TITLE.width() + 2 + tabs_w + ai.width() + 2;
+    let free = width.saturating_sub(used);
+    // Tabs sit in the middle: split the free space around them.
+    let pad_left = 2 + free / 2;
+    let pad_right = width.saturating_sub(TITLE.width() + pad_left + tabs_w + ai.width());
+    spans.push(Span::raw(" ".repeat(pad_left)));
+    for &i in &shown {
+        let tab = format!("{} ", tabs[i]);
         if i == active {
             spans.push(Span::styled(
-                format!("{tab} "),
+                tab,
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ));
         } else {
-            spans.push(Span::styled(
-                format!("{tab} "),
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(tab, Style::default().fg(Color::DarkGray)));
         }
     }
-    let right = if agent_ok { "● agent" } else { "○ offline" };
-    let pad = width.saturating_sub(used + right.width() + 2);
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(
-        right.to_string(),
-        Style::default().fg(if agent_ok { Color::Green } else { Color::Red }),
-    ));
+    spans.push(Span::raw(" ".repeat(pad_right.max(1))));
+    spans.push(Span::styled(ai, Style::default().fg(Color::DarkGray)));
     RLine::from(spans)
+}
+
+fn tabs_width(tabs: &[String], shown: &[usize]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    shown.iter().map(|&i| tabs[i].width() + 1).sum()
 }
 
 fn fkey_bar() -> String {
@@ -955,21 +948,15 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let a = layout_areas(f.area(), app.picker.font_size());
     let ws = app.ws();
 
-    f.render_widget(Block::default().borders(Borders::ALL), a.header);
-    let inner_w = a.header.width.saturating_sub(2) as usize;
     f.render_widget(
         Paragraph::new(header_line(
-            inner_w,
+            a.header.width as usize,
             &app.workspaces,
             app.active,
-            !app.agent_offline,
+            ws.settings.ckpt.as_str(),
+            ws.chat_model.as_deref(),
         )),
-        Rect {
-            x: a.header.x + 1,
-            y: a.header.y + 1,
-            width: a.header.width.saturating_sub(2),
-            height: 1,
-        },
+        a.header,
     );
 
     let title = if ws.gallery.is_empty() {
@@ -1007,21 +994,8 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
         a.settings,
     );
 
-    // Right column: per-workspace models on top, then chat.
-    let chat_model = ws
-        .chat_model
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-    f.render_widget(
-        Paragraph::new(vec![
-            RLine::from(format!("image AI: {}", short_ckpt(&ws.settings.ckpt))),
-            RLine::from(format!("chat AI:  {chat_model}")),
-        ])
-        .block(Block::default().borders(Borders::ALL).title("models")),
-        a.models,
-    );
-
-    // Chat pane (right, ~20).
+    // Chat pane (right, ~20). The per-workspace AIs live in the header
+    // now; this column is chat plus input only.
     let w = a.chat_msgs.width.saturating_sub(2).max(10) as usize;
     let mut lines: Vec<RLine> = Vec::new();
     for (role, text) in &ws.chat {
@@ -1589,33 +1563,31 @@ mod tests {
         let r = parse_render("a fox --w 1024 --n 2").resolve(&settings);
         assert_eq!((r.w, r.h, r.steps, r.n), (1024, 512, 8, 2));
         let mut quality = RenderSettings::default();
-        quality.cycle_preset(2); // Quality 1024, 20 steps
+        quality.set_preset(2); // Quality 1024, 20 steps
         let r = parse_render("a fox").resolve(&quality);
         assert_eq!((r.w, r.h, r.steps, r.n), (1024, 1024, 20, 1));
     }
 
     #[test]
-    fn settings_cycle_and_clamp() {
+    fn settings_setters_clamp_and_describe() {
         let mut s = RenderSettings::default();
         assert_eq!(s.describe(), "Fast 512x512 · 8 steps · n=1");
-        s.cycle_preset(1);
-        assert_eq!(s.name(), "Balanced");
-        s.cycle_preset(1);
+        s.set_preset(2);
         assert_eq!(s.name(), "Quality");
-        s.cycle_preset(1);
-        assert_eq!(s.name(), "Fast"); // wraps
-        s.adjust_steps(1000);
+        assert_eq!(s.steps, 20);
+        s.set_preset(99);
+        assert_eq!(s.name(), "Quality"); // clamps
+        s.set_steps(1000);
         assert_eq!(s.steps, 50);
-        s.adjust_steps(-1000);
+        s.set_steps(-1000);
         assert_eq!(s.steps, 4);
-        s.cycle_count();
-        s.cycle_count();
+        s.set_count(3);
         assert_eq!(s.n, 3);
-        assert_eq!(
-            s.apply_key(']'),
-            Some("preset → Balanced 768x768 · 14 steps · n=3".to_string())
-        );
-        assert_eq!(s.apply_key('x'), None);
+        s.set_count(99);
+        assert_eq!(s.n, 4);
+        s.set_preset(1);
+        assert_eq!(s.describe(), "Balanced 768x768 · 14 steps · n=4");
+        assert_eq!(s.ckpt, comfy::DEFAULT_CKPT);
     }
 
     #[test]
@@ -1710,7 +1682,7 @@ mod tests {
             "header title lost"
         );
         assert!(flat.contains("[1 main]"), "workspace tab lost");
-        assert!(flat.contains("image AI:"), "models box lost");
+        assert!(flat.contains("img:"), "header AI info lost");
         assert!(flat.contains("F2 model"), "fkey bar lost");
         // Horizontal seam between picture and provenance is a single line:
         // recompute the layout and check the provenance top row has no ─ run.
@@ -1759,14 +1731,30 @@ mod tests {
             Workspace::new("main".to_string()),
             Workspace::new("portraits".to_string()),
         ];
-        let line = header_line(100, &ws, 1, true);
+        let line = header_line(140, &ws, 1, "juggernautXL.safetensors", Some("pro"));
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.starts_with("CCTI - Corbet ComfyUi Terminal Interface"));
         assert!(text.contains("[2 portraits]"));
-        assert!(text.contains("● agent"));
-        let line = header_line(100, &ws, 0, false);
+        assert!(text.contains("img: juggernautXL.safetensors"));
+        assert!(text.contains("chat: pro"));
+        let line = header_line(140, &ws, 0, "m.safetensors", None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("○ offline"));
+        assert!(text.contains("[1 main]"));
+        assert!(text.contains("chat: default"));
+    }
+
+    #[test]
+    fn header_line_squeezes_inactive_tabs_first() {
+        let ws = vec![
+            Workspace::new("main".to_string()),
+            Workspace::new("portraits".to_string()),
+            Workspace::new("extra".to_string()),
+        ];
+        // Narrow: active tab survives, others may go.
+        let line = header_line(70, &ws, 2, "m.safetensors", None);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("[3 extra]"), "active tab lost: {text}");
+        assert!(text.starts_with("CCTI - Corbet ComfyUi Terminal Interface"));
     }
 
     #[test]

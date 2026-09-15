@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.7 — 2026-09-15
+
+- Header bar: title left, workspace tabs centered, per-workspace image +
+  chat AI right. Multiple workspaces (F6/F7 switch, F8 new) with isolated
+  galleries, chats and settings.
+- F-key bar with submenus: model (live checkpoints), size, steps, batch.
+  Render settings box shows current values. Single-key shortcuts removed.
+- Pixel-matched gaps from live font metrics.
+
 ## 0.1.6 — 2026-09-15
 
 - Header bar (title, workspace tabs, agent state), multiple workspaces with
