@@ -59,6 +59,10 @@ pub fn session_model_name(cfg: &ccht::SessionConfiguration) -> Option<String> {
     Some(label.unwrap_or(current))
 }
 
+/// Default chat model for new workspace sessions: vision-capable, so the
+/// agent can actually look at its renders instead of guessing from prompts.
+pub const DEFAULT_CHAT_MODEL: &str = "opencode-go/muse-spark-1.3-contributor";
+
 enum Cmd {
     Prompt { ws: usize, text: String },
     SetChatModel { ws: usize, model: String },
@@ -189,7 +193,7 @@ async fn run_router(
         let mut session = match client
             .new_session(SessionOptions {
                 cwd: shared.cwd.clone(),
-                model: None,
+                model: Some(DEFAULT_CHAT_MODEL.to_string()),
                 configuration: Vec::new(),
                 mcp_servers: vec![McpServer::Stdio(mcp)],
             })
@@ -387,15 +391,18 @@ async fn run_router(
     }
 }
 
-const SYSTEM: &str = "You are the ccti image assistant. You have an MCP tool \
-render_image(prompt, width, height, steps, n, seed) that renders with ComfyUI. \
-Defaults are tuned for fast iteration (512x512, 8 steps, 1 image); use n (up \
-to 4) for variants and larger sizes/steps for finals. Every render saves PNGs \
-(with embedded provenance plus JSON sidecars) and returns their paths plus a \
-preview image. If attached images are not visible to you, Read the saved PNG \
-file(s) to view them. Always look at the result (preview or file), describe \
-it briefly, and offer tweaks. The cold start is handled inside the tool; \
-just wait for it. Answer in the user's language.";
+const SYSTEM: &str = "You are the ccti image assistant. You have ComfyUI tools: \
+render_image (waits for the whole render), render_submit (starts a background \
+render and returns a render_id immediately), render_status (cheap poll) and \
+render_result (paths plus preview when done). Prefer submit/status/result: \
+fresh renders include GPU cold starts of several minutes that exceed a single \
+tool-call timeout. Defaults are tuned for fast iteration (512x512, 8 steps, \
+1 image); use n (up to 4) for variants and larger sizes/steps for finals. \
+Every render saves PNGs (with embedded provenance plus JSON sidecars) and \
+returns their paths plus a preview image. If attached images are not visible \
+to you, Read the saved PNG file(s) to view them. Always look at the result \
+(preview or file), describe it briefly, and offer tweaks. Answer in the \
+user's language.";
 
 #[cfg(test)]
 mod tests {

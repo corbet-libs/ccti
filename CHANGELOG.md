@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.9 — 2026-09-15
+
+- Muse Spark 1.3 is the default chat model (vision-capable): the agent
+  looks at its renders instead of guessing from prompts (verified live).
+- Async render tools: render_submit answers instantly, render_status polls
+  cheaply, render_result delivers paths plus preview. Survives GPU cold
+  starts that exceed client tool timeouts.
+- `--agent-vision` probe: render plus describe for vision verification.
+
 ## 0.1.8 — 2026-09-15
 
 - Real chat model display: header shows the session's reported model

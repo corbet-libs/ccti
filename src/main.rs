@@ -29,6 +29,9 @@ async fn main() -> Result<()> {
     if has("--agent-probe") {
         return agent_probe().await;
     }
+    if has("--agent-vision") {
+        return agent_vision().await;
+    }
     if has("--help") || has("-h") {
         println!("{}", help_text());
         return Ok(());
@@ -189,6 +192,61 @@ async fn agent_probe() -> Result<()> {
     }
 }
 
+/// Vision check: the agent renders a known picture through its own tool,
+/// then describes what it sees. A text-only model can only parrot the
+/// prompt; a seeing model names details that were never written down.
+/// The human judges by reading the saved file afterwards.
+async fn agent_vision() -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<UiMsg>();
+    let exe = std::env::current_exe()?;
+    let agent = agent::Agent::spawn(exe, std::env::temp_dir(), tx.clone()).await?;
+    // Same file watcher as the TUI so tool-side renders surface here too.
+    tokio::spawn(async move { ui::watch_renders(tx).await });
+    agent.prompt(
+        "Use render_image to render 'a yellow submarine under a blue sky, \
+         cartoon, flat colors' at 512x512 with 8 steps. Afterwards describe \
+         in detail what you actually see in the rendered image: which \
+         objects, which colors, what composition, anything unexpected. \
+         Base the description on the image itself, not on my prompt."
+            .to_string(),
+        0,
+    );
+    let deadline = tokio::time::sleep(Duration::from_secs(1200));
+    tokio::pin!(deadline);
+    let mut saw_image = false;
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    UiMsg::Chat { ws, role, text } => {
+                        println!("--- ws{} {role} ---\n{text}\n", ws.unwrap_or(0));
+                        // Description arriving after the render: verdict time.
+                        if role == "agent" && saw_image && text.chars().count() > 200 {
+                            break;
+                        }
+                    }
+                    UiMsg::SessionModel { ws, model } => {
+                        println!("ws{ws} session model: {model}");
+                    }
+                    UiMsg::Image { ws, label, .. } => {
+                        println!("ws{} image: {label}", ws.unwrap_or(0));
+                        saw_image = true;
+                    }
+                    UiMsg::Error(e) => println!("error: {e}"),
+                    UiMsg::Status(s) => println!("status: {s}"),
+                    _ => {}
+                }
+            }
+            _ = &mut deadline => {
+                println!("TIMEOUT waiting for vision probe");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn help_text() -> String {
     format!(
         "ccti {} — ComfyUI TUI: agentic image chat with inline terminal rendering\n\n\
@@ -197,8 +255,9 @@ fn help_text() -> String {
            ccti --render PROMPT [--out FILE] [--w N --h N --steps N --n 1-4]\n  \
            ccti --models                     List ComfyUI checkpoints\n  \
            ccti --mcp                        MCP stdio server (render_image tool)\n  \
-           ccti --agent-probe                Two parallel prompts (parallelism check)\n  \
-           ccti --help | --version",
+            ccti --agent-probe                Two parallel prompts (parallelism check)\n  \
+            ccti --agent-vision               Render + describe (vision check)\n  \
+            ccti --help | --version",
         env!("CARGO_PKG_VERSION")
     )
 }

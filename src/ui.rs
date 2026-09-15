@@ -1373,7 +1373,7 @@ async fn direct_render(c: &Client, tx: &mpsc::UnboundedSender<UiMsg>, r: Resolve
 }
 
 /// Surface agent-side renders (MCP tool saves ccti_*.png) in the gallery.
-async fn watch_renders(tx: mpsc::UnboundedSender<UiMsg>) {
+pub(crate) async fn watch_renders(tx: mpsc::UnboundedSender<UiMsg>) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let dir = format!("{home}/images/generated");
     let mut seen = std::time::SystemTime::now();
