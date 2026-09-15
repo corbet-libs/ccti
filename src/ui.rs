@@ -15,7 +15,7 @@ use futures::StreamExt as _;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect, Size},
+    layout::{Constraint, Direction, Layout, Margin, Rect, Size},
     style::{Color, Style},
     text::{Line as RLine, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -62,6 +62,7 @@ struct App {
     busy: bool,
     agent_offline: bool,
     cells: Size,
+    settings: RenderSettings,
 }
 
 pub async fn run() -> Result<()> {
@@ -78,68 +79,191 @@ fn is_wide(area: Rect) -> bool {
     area.width >= 100
 }
 
-/// Split main area into (image, chat). Wide screens go 80/20 side by side,
-/// narrow ones stack image over chat.
+/// Split main area into (image, chat) with one breathing cell between them.
+/// Wide screens go 80/20 side by side, narrow ones stack image over chat.
 fn split(area: Rect) -> (Rect, Rect) {
     if is_wide(area) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(80), Constraint::Percentage(20)])
+            .spacing(1)
             .split(area);
         (cols[0], cols[1])
     } else {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .spacing(1)
             .split(area);
         (rows[0], rows[1])
     }
 }
 
-/// Shared seams are drawn exactly once: the upper/left box owns the edge,
-/// the neighbour drops it. Titles move to the remaining outer edge so no
-/// box ends up title-less.
-fn pic_block(title: String) -> Block<'static> {
-    Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .title(title)
+/// All pane rectangles, computed once per frame from the same math so the
+/// image protocol size always matches what is actually drawn.
+struct Areas {
+    pic: Rect,
+    prov: Rect,
+    settings: Rect,
+    chat_msgs: Rect,
+    chat_input: Rect,
+    status: Rect,
 }
 
-fn prov_block() -> Block<'static> {
-    Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
-        .title_bottom("provenance")
-}
-
-fn chat_block(wide: bool) -> Block<'static> {
-    // Wide: seam is vertical, drop LEFT. Narrow (stacked): seam is
-    // horizontal against provenance's bottom edge, drop TOP instead.
-    let borders = if wide {
-        Borders::TOP | Borders::RIGHT | Borders::BOTTOM
-    } else {
-        Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
-    };
-    let block = Block::default().borders(borders);
-    if wide {
-        block.title("chat")
-    } else {
-        block.title_bottom("chat")
+fn layout_areas(area: Rect) -> Areas {
+    let outer = area.inner(Margin::new(1, 1));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .spacing(1)
+        .split(outer);
+    let (img_col, chat_col) = split(rows[0]);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ])
+        .spacing(1)
+        .split(img_col);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .spacing(1)
+        .split(chat_col);
+    Areas {
+        pic: left[0],
+        prov: left[1],
+        settings: left[2],
+        chat_msgs: right[0],
+        chat_input: right[1],
+        status: rows[1],
     }
 }
 
-fn input_block(wide: bool) -> Block<'static> {
-    // Same vertical seam rule as the chat box above it.
-    let borders = if wide {
-        Borders::RIGHT | Borders::BOTTOM
-    } else {
-        Borders::LEFT | Borders::RIGHT | Borders::BOTTOM
-    };
-    Block::default().borders(borders)
+/// Every pane keeps its full frame and top title; air between panes comes
+/// from layout gaps, never from dropped borders.
+fn pic_block(title: String) -> Block<'static> {
+    Block::default().borders(Borders::ALL).title(title)
+}
+
+fn prov_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL).title("provenance")
+}
+
+fn settings_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL).title("render")
+}
+
+fn chat_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL).title("chat")
+}
+
+fn input_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL)
+}
+
+/// Render presets: fast iteration first, quality on demand.
+const PRESETS: [(&str, u32, u32, u32); 3] = [
+    ("Fast", 512, 512, 8),
+    ("Balanced", 768, 768, 14),
+    ("Quality", 1024, 1024, 20),
+];
+
+/// Defaults behind every `/render` without explicit flags. Adjusted live
+/// with single keys while the input line is empty.
+#[derive(Debug, Clone, PartialEq)]
+struct RenderSettings {
+    preset: usize,
+    steps: u32,
+    n: u32,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            preset: 0,
+            steps: PRESETS[0].3,
+            n: 1,
+        }
+    }
+}
+
+impl RenderSettings {
+    fn dims(&self) -> (u32, u32) {
+        (PRESETS[self.preset].1, PRESETS[self.preset].2)
+    }
+
+    fn name(&self) -> &'static str {
+        PRESETS[self.preset].0
+    }
+
+    fn cycle_preset(&mut self, dir: i32) {
+        let n = PRESETS.len() as i32;
+        self.preset = (self.preset as i32 + dir).rem_euclid(n) as usize;
+        self.steps = PRESETS[self.preset].3;
+    }
+
+    fn adjust_steps(&mut self, delta: i32) {
+        self.steps = (self.steps as i32 + delta).clamp(4, 50) as u32;
+    }
+
+    fn cycle_count(&mut self) {
+        self.n = if self.n >= 4 { 1 } else { self.n + 1 };
+    }
+
+    /// Single-key adjustment, active only while the input line is empty.
+    /// Returns a status line when the key applied, None to keep typing it.
+    fn apply_key(&mut self, c: char) -> Option<String> {
+        match c {
+            '[' => {
+                self.cycle_preset(-1);
+                Some(format!("preset → {}", self.describe()))
+            }
+            ']' => {
+                self.cycle_preset(1);
+                Some(format!("preset → {}", self.describe()))
+            }
+            '-' => {
+                self.adjust_steps(-2);
+                Some(format!("steps → {}", self.steps))
+            }
+            '+' | '=' => {
+                self.adjust_steps(2);
+                Some(format!("steps → {}", self.steps))
+            }
+            _ => None,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let (w, h) = self.dims();
+        format!(
+            "{} {w}x{h} · {} steps · n={}",
+            self.name(),
+            self.steps,
+            self.n
+        )
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let (w, h) = self.dims();
+        vec![
+            "[ ] preset · -/+ steps · Tab count (empty input only)".to_string(),
+            format!("preset: {} · {w}x{h}", self.name()),
+            format!("steps: {} · count: n={}", self.steps, self.n),
+            format!("model: {}", short_ckpt(comfy::DEFAULT_CKPT)),
+        ]
+    }
 }
 
 fn gallery_cells(area: Rect) -> Size {
-    let (img, _) = split(area);
-    Size::new(img.width.saturating_sub(2), img.height.saturating_sub(2))
+    let a = layout_areas(area);
+    Size::new(
+        a.pic.width.saturating_sub(2),
+        a.pic.height.saturating_sub(2),
+    )
 }
 
 fn decode(bytes: &[u8]) -> Result<image::DynamicImage> {
@@ -226,6 +350,7 @@ async fn run_inner() -> Result<()> {
         busy: false,
         agent_offline: false,
         cells: gallery_cells(full),
+        settings: RenderSettings::default(),
     };
     let mut events = EventStream::new();
 
@@ -274,7 +399,21 @@ async fn run_inner() -> Result<()> {
                                     break;
                                 }
                             }
-                            KeyCode::Char(c) => app.input.push(c),
+                            KeyCode::Char(c) => {
+                                // Settings keys act only on an empty input
+                                // line, so typing prompts never misfires.
+                                if app.input.is_empty()
+                                    && let Some(msg) = app.settings.apply_key(c)
+                                {
+                                    app.status = msg;
+                                } else {
+                                    app.input.push(c);
+                                }
+                            }
+                            KeyCode::Tab if app.input.is_empty() => {
+                                app.settings.cycle_count();
+                                app.status = format!("count → n={}", app.settings.n);
+                            }
                             KeyCode::Backspace => { app.input.pop(); }
                             KeyCode::Esc => {
                                 if app.busy { agent.cancel(); }
@@ -399,21 +538,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
-    let area = f.area();
-    let wide = is_wide(area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
-    let (img_rect, chat_rect) = split(rows[0]);
-
-    // Image pane (left, ~80): picture on top, provenance below.
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(8)])
-        .split(img_rect);
-    let pic_rect = left[0];
-    let prov_rect = left[1];
+    let a = layout_areas(f.area());
     let title = if app.gallery.is_empty() {
         "image — nothing rendered yet".to_string()
     } else {
@@ -425,15 +550,15 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
             item.label
         )
     };
-    f.render_widget(pic_block(title), pic_rect);
+    f.render_widget(pic_block(title), a.pic);
     if let Some(item) = app.gallery.get(app.gidx)
         && let Some(proto) = &item.proto
     {
         let inner = Rect {
-            x: pic_rect.x + 1,
-            y: pic_rect.y + 1,
-            width: pic_rect.width.saturating_sub(2),
-            height: pic_rect.height.saturating_sub(2),
+            x: a.pic.x + 1,
+            y: a.pic.y + 1,
+            width: a.pic.width.saturating_sub(2),
+            height: a.pic.height.saturating_sub(2),
         };
         f.render_widget(Image::new(proto), inner);
     }
@@ -446,15 +571,15 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
         Paragraph::new(prov.join("\n"))
             .block(prov_block())
             .wrap(Wrap { trim: true }),
-        prov_rect,
+        a.prov,
+    );
+    f.render_widget(
+        Paragraph::new(app.settings.lines().join("\n")).block(settings_block()),
+        a.settings,
     );
 
     // Chat pane (right, ~20).
-    let cols = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(chat_rect);
-    let w = chat_rect.width.saturating_sub(2).max(10) as usize;
+    let w = a.chat_msgs.width.saturating_sub(2).max(10) as usize;
     let mut lines: Vec<RLine> = Vec::new();
     for (role, text) in &app.chat {
         let color = match role.as_str() {
@@ -483,22 +608,22 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
             }
         }
     }
-    let visible = cols[0].height.saturating_sub(2) as usize;
+    let visible = a.chat_msgs.height.saturating_sub(2) as usize;
     let skip = lines.len().saturating_sub(visible.max(1));
     let msg = Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>())
-        .block(chat_block(wide))
+        .block(chat_block())
         .wrap(Wrap { trim: false });
-    f.render_widget(msg, cols[0]);
+    f.render_widget(msg, a.chat_msgs);
     let prompt = if app.busy {
         "…working (Esc cancels)"
     } else {
         ">"
     };
-    let input = Paragraph::new(format!("{prompt} {}", app.input)).block(input_block(wide));
-    f.render_widget(input, cols[1]);
+    let input = Paragraph::new(format!("{prompt} {}", app.input)).block(input_block());
+    f.render_widget(input, a.chat_input);
 
     let status = Paragraph::new(app.status.clone()).style(Style::default().fg(Color::DarkGray));
-    f.render_widget(status, rows[1]);
+    f.render_widget(status, a.status);
 }
 
 /// Local slash commands. Returns false to quit.
@@ -559,13 +684,14 @@ fn handle_command(
         }
         "render" => {
             let rest = line[1..].trim_start_matches("render").trim().to_string();
-            let (prompt, w, h, steps, n) = parse_render(&rest);
-            if prompt.is_empty() {
+            let args = parse_render(&rest);
+            if args.prompt.is_empty() {
                 let _ = tx.send(UiMsg::Error(
                     "usage: /render TEXT [--w N --h N --steps N --n 1-4]".into(),
                 ));
                 return true;
             }
+            let (prompt, w, h, steps, n) = args.resolve(&app.settings);
             let tx2 = tx.clone();
             let c = comfy.clone();
             let prompt2 = prompt.clone();
@@ -584,26 +710,56 @@ fn handle_command(
     true
 }
 
-fn parse_render(rest: &str) -> (String, u32, u32, u32, u32) {
-    let (mut w, mut h, mut steps, mut n) = (512_u32, 512_u32, 8_u32, 1_u32);
+/// Parsed `/render` flags; every numeric is optional and falls back to
+/// the live render settings box when absent.
+#[derive(Debug, PartialEq)]
+struct RenderArgs {
+    prompt: String,
+    w: Option<u32>,
+    h: Option<u32>,
+    steps: Option<u32>,
+    n: Option<u32>,
+}
+
+impl RenderArgs {
+    fn resolve(&self, settings: &RenderSettings) -> (String, u32, u32, u32, u32) {
+        let (dw, dh) = settings.dims();
+        (
+            self.prompt.clone(),
+            self.w.unwrap_or(dw),
+            self.h.unwrap_or(dh),
+            self.steps.unwrap_or(settings.steps),
+            self.n.unwrap_or(settings.n),
+        )
+    }
+}
+
+fn parse_render(rest: &str) -> RenderArgs {
+    let (mut w, mut h, mut steps, mut n) = (None, None, None, None);
     let mut words: Vec<&str> = Vec::new();
     let mut it = rest.split_whitespace().peekable();
     while let Some(tok) = it.next() {
         match tok {
-            "--w" => w = it.next().and_then(|v| v.parse().ok()).unwrap_or(w),
-            "--h" => h = it.next().and_then(|v| v.parse().ok()).unwrap_or(h),
-            "--steps" => steps = it.next().and_then(|v| v.parse().ok()).unwrap_or(steps),
+            "--w" => w = it.next().and_then(|v| v.parse().ok()).or(w),
+            "--h" => h = it.next().and_then(|v| v.parse().ok()).or(h),
+            "--steps" => steps = it.next().and_then(|v| v.parse().ok()).or(steps),
             "--n" => {
                 n = it
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(n)
-                    .clamp(1, 4)
+                    .map(|v: u32| v.clamp(1, 4))
+                    .or(n)
             }
             _ => words.push(tok),
         }
     }
-    (words.join(" "), w, h, steps, n)
+    RenderArgs {
+        prompt: words.join(" "),
+        w,
+        h,
+        steps,
+        n,
+    }
 }
 
 async fn direct_render(
@@ -743,6 +899,7 @@ mod tests {
             busy: false,
             agent_offline: false,
             cells: Size::new(80, 24),
+            settings: RenderSettings::default(),
         }
     }
 
@@ -760,17 +917,19 @@ mod tests {
     #[test]
     fn wide_screens_split_80_20_side_by_side() {
         let (img, chat) = split(Rect::new(0, 0, 120, 40));
-        assert_eq!(img.width, 96);
-        assert_eq!(chat.width, 24);
+        // 119 cells for panes + 1 gap cell.
+        assert_eq!(img.width + chat.width, 119);
         assert_eq!(img.height, chat.height);
+        assert_eq!(chat.x, img.x + img.width + 1);
     }
 
     #[test]
     fn narrow_screens_stack_image_over_chat() {
         let (img, chat) = split(Rect::new(0, 0, 80, 40));
         assert_eq!(img.width, 80);
-        assert_eq!(img.height, 24);
-        assert_eq!(chat.y, 24);
+        // 39 cells for panes + 1 gap cell.
+        assert_eq!(img.height + chat.height, 39);
+        assert_eq!(chat.y, img.y + img.height + 1);
     }
 
     #[test]
@@ -787,16 +946,32 @@ mod tests {
         assert_eq!(app.gidx, 1);
     }
 
+    fn args(
+        prompt: &str,
+        w: Option<u32>,
+        h: Option<u32>,
+        steps: Option<u32>,
+        n: Option<u32>,
+    ) -> RenderArgs {
+        RenderArgs {
+            prompt: prompt.to_string(),
+            w,
+            h,
+            steps,
+            n,
+        }
+    }
+
     #[test]
-    fn parse_render_plain_prompt_keeps_fast_defaults() {
-        assert_eq!(parse_render("a fox"), ("a fox".to_string(), 512, 512, 8, 1));
+    fn parse_render_plain_prompt_leaves_everything_unset() {
+        assert_eq!(parse_render("a fox"), args("a fox", None, None, None, None));
     }
 
     #[test]
     fn parse_render_honours_flags() {
         assert_eq!(
             parse_render("a fox --w 1024 --h 512 --steps 20 --n 3"),
-            ("a fox".to_string(), 1024, 512, 20, 3)
+            args("a fox", Some(1024), Some(512), Some(20), Some(3))
         );
     }
 
@@ -804,15 +979,61 @@ mod tests {
     fn parse_render_ignores_broken_flag_values() {
         assert_eq!(
             parse_render("x --steps abc"),
-            ("x".to_string(), 512, 512, 8, 1)
+            args("x", None, None, None, None)
         );
-        assert_eq!(parse_render("--w 100"), ("".to_string(), 100, 512, 8, 1));
+        assert_eq!(
+            parse_render("--w 100"),
+            args("", Some(100), None, None, None)
+        );
     }
 
     #[test]
     fn parse_render_clamps_batch() {
-        assert_eq!(parse_render("x --n 99"), ("x".to_string(), 512, 512, 8, 4));
-        assert_eq!(parse_render("x --n 0"), ("x".to_string(), 512, 512, 8, 1));
+        assert_eq!(parse_render("x --n 99").n, Some(4));
+        assert_eq!(parse_render("x --n 0").n, Some(1));
+    }
+
+    #[test]
+    fn resolve_prefers_flags_over_settings() {
+        let settings = RenderSettings::default(); // Fast 512, 8 steps, n=1
+        assert_eq!(
+            parse_render("a fox").resolve(&settings),
+            ("a fox".to_string(), 512, 512, 8, 1)
+        );
+        assert_eq!(
+            parse_render("a fox --w 1024 --n 2").resolve(&settings),
+            ("a fox".to_string(), 1024, 512, 8, 2)
+        );
+        let mut quality = RenderSettings::default();
+        quality.cycle_preset(2); // Quality 1024, 20 steps
+        assert_eq!(
+            parse_render("a fox").resolve(&quality),
+            ("a fox".to_string(), 1024, 1024, 20, 1)
+        );
+    }
+
+    #[test]
+    fn settings_cycle_and_clamp() {
+        let mut s = RenderSettings::default();
+        assert_eq!(s.describe(), "Fast 512x512 · 8 steps · n=1");
+        s.cycle_preset(1);
+        assert_eq!(s.name(), "Balanced");
+        s.cycle_preset(1);
+        assert_eq!(s.name(), "Quality");
+        s.cycle_preset(1);
+        assert_eq!(s.name(), "Fast"); // wraps
+        s.adjust_steps(1000);
+        assert_eq!(s.steps, 50);
+        s.adjust_steps(-1000);
+        assert_eq!(s.steps, 4);
+        s.cycle_count();
+        s.cycle_count();
+        assert_eq!(s.n, 3);
+        assert_eq!(
+            s.apply_key(']'),
+            Some("preset → Balanced 768x768 · 14 steps · n=3".to_string())
+        );
+        assert_eq!(s.apply_key('x'), None);
     }
 
     #[test]

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5 — 2026-09-15
+
+- Breathing room: one-cell gaps plus outer margin between all panes; every
+  box keeps its full frame and top title (provenance stroke restored).
+- Render settings box (bottom left): size presets Fast/Balanced/Quality,
+  steps and batch count, live-adjustable via `[` `]` `-` `+` `Tab` while the
+  input line is empty; `/render` flags override, plain `/render` uses them.
+
 ## 0.1.4 — 2026-09-15
 
 - Single-line seams: neighbouring panes share one border instead of drawing
