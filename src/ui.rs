@@ -49,7 +49,14 @@ pub enum UiMsg {
         ws: usize,
         model: String,
     },
-    AgentBusy(bool),
+    SessionModel {
+        ws: usize,
+        model: String,
+    },
+    AgentBusy {
+        ws: usize,
+        busy: bool,
+    },
     AgentDone,
     Error(String),
 }
@@ -61,16 +68,19 @@ struct GalleryItem {
     proto: Option<Protocol>,
 }
 
-/// One workspace: its own pictures, chat, render settings and chat model.
-/// The agent backend session is shared; turns are tagged so late answers
-/// still land where they were asked.
+/// One workspace: its own pictures, chat, render settings and models.
+/// Each workspace gets its own agent session on first use, so turns run
+/// in parallel across workspaces and strictly sequential within one.
 struct Workspace {
     name: String,
     chat: Vec<(String, String)>,
     gallery: Vec<GalleryItem>,
     gidx: usize,
     settings: RenderSettings,
+    /// Explicit override via `/chat-model` (takes effect live).
     chat_model: Option<String>,
+    /// Model the session itself reports (authoritative when no override).
+    session_model: Option<String>,
 }
 
 impl Workspace {
@@ -82,7 +92,17 @@ impl Workspace {
             gidx: 0,
             settings: RenderSettings::default(),
             chat_model: None,
+            session_model: None,
         }
+    }
+
+    /// What the header shows: explicit override wins, then the session's
+    /// own report, never a made-up "default".
+    fn effective_chat_model(&self) -> &str {
+        self.chat_model
+            .as_deref()
+            .or(self.session_model.as_deref())
+            .unwrap_or("…")
     }
 }
 
@@ -92,7 +112,8 @@ struct App {
     input: String,
     status: String,
     picker: Picker,
-    busy: bool,
+    /// Workspaces with a turn in flight (parallel sessions).
+    busy: Vec<usize>,
     agent_offline: bool,
     cells: Size,
     menu: Option<Menu>,
@@ -508,7 +529,6 @@ impl RenderSettings {
     fn lines(&self) -> Vec<String> {
         let (w, h) = self.dims();
         vec![
-            "F2 model · F3 size · F4 steps · F5 count".to_string(),
             format!("preset: {} · {w}x{h}", self.name()),
             format!("steps: {} · count: n={}", self.steps, self.n),
             format!("model: {}", short_ckpt(&self.ckpt)),
@@ -615,7 +635,7 @@ async fn run_inner() -> Result<()> {
         input: String::new(),
         status: "starting…".into(),
         picker,
-        busy: false,
+        busy: Vec::new(),
         agent_offline: false,
         cells: gallery_cells(full, font),
         menu: None,
@@ -671,9 +691,26 @@ async fn run_inner() -> Result<()> {
                             ));
                         }
                     }
-                    UiMsg::AgentBusy(b) => {
-                        app.busy = b;
-                        if !b { app.status = "ready".into(); }
+                    UiMsg::SessionModel { ws, model } => {
+                        if let Some(w) = app.workspaces.get_mut(ws) {
+                            w.session_model = Some(model.clone());
+                            w.chat.push((
+                                "sys".into(),
+                                format!("session model: {model}"),
+                            ));
+                        }
+                    }
+                    UiMsg::AgentBusy { ws, busy } => {
+                        if busy {
+                            if !app.busy.contains(&ws) {
+                                app.busy.push(ws);
+                            }
+                        } else {
+                            app.busy.retain(|&w| w != ws);
+                        }
+                        if app.busy.is_empty() {
+                            app.status = "ready".into();
+                        }
                     }
                     UiMsg::AgentDone => {
                         app.status = "turn done".into();
@@ -733,7 +770,7 @@ async fn run_inner() -> Result<()> {
                             }
                             KeyCode::Backspace => { app.input.pop(); }
                             KeyCode::Esc => {
-                                if app.busy { agent.cancel(); }
+                                if !app.busy.is_empty() { agent.cancel(app.active); }
                                 else { app.input.clear(); }
                             }
                             KeyCode::Left if app.input.is_empty() => app.step_history(-1),
@@ -883,7 +920,7 @@ fn header_line(
     let mut ai = format!(
         "img: {} · chat: {}",
         short_ckpt(img_ckpt),
-        chat_model.unwrap_or("default")
+        chat_model.unwrap_or("…")
     );
     // Squeeze policy: drop inactive tabs, then shorten the AI block.
     // (Explicit index loop: keeps borrowck happy on stable toolchains.)
@@ -954,7 +991,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
             &app.workspaces,
             app.active,
             ws.settings.ckpt.as_str(),
-            ws.chat_model.as_deref(),
+            Some(ws.effective_chat_model()),
         )),
         a.header,
     );
@@ -1031,7 +1068,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
         .block(chat_block())
         .wrap(Wrap { trim: false });
     f.render_widget(msg, a.chat_msgs);
-    let prompt = if app.busy {
+    let prompt = if !app.busy.is_empty() {
         "…working (Esc cancels)"
     } else {
         ">"
@@ -1117,7 +1154,7 @@ fn handle_command(
             let _ = tx.send(UiMsg::Chat { ws: None, role: "sys".into(), text:
                 "/render TEXT [--w N --h N --steps N --n 1-4] direct render (settings box defaults) · /models list checkpoints · /chat-model <id> switch chat model · /cancel stop agent turn · ←/→ images · F1 keys · F2 model · F3 size · F4 steps · F5 count · F6/F7 workspace · F8 new · /quit".into() });
         }
-        "cancel" => agent.cancel(),
+        "cancel" => agent.cancel(app.active),
         "models" => {
             let tx = tx.clone();
             let c = comfy.clone();
@@ -1396,7 +1433,7 @@ mod tests {
             input: String::new(),
             status: String::new(),
             picker: Picker::halfblocks(),
-            busy: false,
+            busy: Vec::new(),
             agent_offline: false,
             cells: Size::new(80, 24),
             menu: None,
@@ -1740,7 +1777,8 @@ mod tests {
         let line = header_line(140, &ws, 0, "m.safetensors", None);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("[1 main]"));
-        assert!(text.contains("chat: default"));
+        assert!(text.contains("chat: …"));
+        assert!(!text.contains("chat: default"));
     }
 
     #[test]
@@ -1755,6 +1793,17 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("[3 extra]"), "active tab lost: {text}");
         assert!(text.starts_with("CCTI - Corbet ComfyUi Terminal Interface"));
+    }
+
+    #[test]
+    fn effective_chat_model_prefers_override_then_session() {
+        let mut w = Workspace::new("main".to_string());
+        // Nothing known: honest placeholder, never "default".
+        assert_eq!(w.effective_chat_model(), "…");
+        w.session_model = Some("Muse Spark".to_string());
+        assert_eq!(w.effective_chat_model(), "Muse Spark");
+        w.chat_model = Some("custom-1".to_string());
+        assert_eq!(w.effective_chat_model(), "custom-1");
     }
 
     #[test]

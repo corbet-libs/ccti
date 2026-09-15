@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.8 — 2026-09-15
+
+- Real chat model display: header shows the session's reported model
+  (override, session report, honest placeholder) instead of "default".
+- Parallel workspace sessions: one agent session per workspace, created
+  lazily; turns run in parallel across workspaces, sequentially within one.
+- Render settings box drops the redundant F-key hint line.
+
 ## 0.1.7 — 2026-09-15
 
 - Header bar: title left, workspace tabs centered, per-workspace image +

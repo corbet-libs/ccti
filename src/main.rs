@@ -10,6 +10,9 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::sync::mpsc;
+
+use crate::ui::UiMsg;
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
@@ -22,6 +25,9 @@ async fn main() -> Result<()> {
 
     if has("--mcp") {
         return mcp::serve().await;
+    }
+    if has("--agent-probe") {
+        return agent_probe().await;
     }
     if has("--help") || has("-h") {
         println!("{}", help_text());
@@ -127,6 +133,62 @@ async fn main() -> Result<()> {
     ui::run().await
 }
 
+/// Diagnostic: fire one prompt per workspace concurrently and print where
+/// each answer lands. With per-workspace sessions both must complete; the
+/// old shared session would reject the second as busy.
+async fn agent_probe() -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<UiMsg>();
+    let exe = std::env::current_exe()?;
+    let agent = agent::Agent::spawn(exe, std::env::temp_dir(), tx).await?;
+    agent.prompt("Reply with exactly: PROBE-OK".to_string(), 0);
+    // Small stagger so both turns overlap instead of queueing politely.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    agent.prompt("Reply with exactly: PROBE-OK".to_string(), 1);
+    let deadline = tokio::time::sleep(Duration::from_secs(420));
+    tokio::pin!(deadline);
+    let mut got = [false, false];
+    let mut models = [None, None];
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    UiMsg::Chat { ws, role, text } if role == "agent" => {
+                        let i = ws.unwrap_or(0);
+                        println!("ws{i} agent: {}", text.trim().chars().take(120).collect::<String>());
+                        if text.contains("PROBE-OK") && i < 2 {
+                            got[i] = true;
+                        }
+                    }
+                    UiMsg::SessionModel { ws, model } => {
+                        println!("ws{ws} session model: {model}");
+                        if ws < 2 {
+                            models[ws] = Some(model);
+                        }
+                    }
+                    UiMsg::Error(e) => println!("error: {e}"),
+                    UiMsg::Status(s) => println!("status: {s}"),
+                    _ => {}
+                }
+                if got == [true, true] {
+                    break;
+                }
+            }
+            _ = &mut deadline => {
+                println!("TIMEOUT waiting for both workspaces");
+                break;
+            }
+        }
+    }
+    println!("ws0 ok: {}, ws1 ok: {}", got[0], got[1]);
+    println!("models: {:?} {:?}", models[0], models[1]);
+    if got == [true, true] {
+        Ok(())
+    } else {
+        anyhow::bail!("parallel probe incomplete")
+    }
+}
+
 fn help_text() -> String {
     format!(
         "ccti {} — ComfyUI TUI: agentic image chat with inline terminal rendering\n\n\
@@ -135,6 +197,7 @@ fn help_text() -> String {
            ccti --render PROMPT [--out FILE] [--w N --h N --steps N --n 1-4]\n  \
            ccti --models                     List ComfyUI checkpoints\n  \
            ccti --mcp                        MCP stdio server (render_image tool)\n  \
+           ccti --agent-probe                Two parallel prompts (parallelism check)\n  \
            ccti --help | --version",
         env!("CARGO_PKG_VERSION")
     )
