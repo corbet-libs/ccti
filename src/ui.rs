@@ -20,7 +20,7 @@ use ratatui::{
     text::{Line as RLine, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
+use ratatui_image::{FontSize, Image, Resize, picker::Picker, protocol::Protocol};
 use tokio::sync::mpsc;
 
 use crate::agent::Agent;
@@ -28,17 +28,26 @@ use crate::comfy::{self, Client};
 use crate::prov::{self, Generation};
 
 /// Messages into the UI loop (agent task, render tasks, watcher).
+/// `ws: None` means "currently active workspace" (local commands, watcher);
+/// agent turns carry their originating workspace.
 #[derive(Debug)]
 pub enum UiMsg {
     Chat {
+        ws: Option<usize>,
         role: String,
         text: String,
     },
     Status(String),
     Image {
+        ws: Option<usize>,
         label: String,
         bytes: Vec<u8>,
         generation: Option<Generation>,
+    },
+    Checkpoints(Vec<String>),
+    ChatModel {
+        ws: usize,
+        model: String,
     },
     AgentBusy(bool),
     AgentDone,
@@ -52,17 +61,270 @@ struct GalleryItem {
     proto: Option<Protocol>,
 }
 
-struct App {
+/// One workspace: its own pictures, chat, render settings and chat model.
+/// The agent backend session is shared; turns are tagged so late answers
+/// still land where they were asked.
+struct Workspace {
+    name: String,
     chat: Vec<(String, String)>,
-    input: String,
-    status: String,
     gallery: Vec<GalleryItem>,
     gidx: usize,
+    settings: RenderSettings,
+    chat_model: Option<String>,
+}
+
+impl Workspace {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            chat: Vec::new(),
+            gallery: Vec::new(),
+            gidx: 0,
+            settings: RenderSettings::default(),
+            chat_model: None,
+        }
+    }
+}
+
+struct App {
+    workspaces: Vec<Workspace>,
+    active: usize,
+    input: String,
+    status: String,
     picker: Picker,
     busy: bool,
     agent_offline: bool,
     cells: Size,
-    settings: RenderSettings,
+    menu: Option<Menu>,
+    checkpoints: Option<Vec<String>>,
+}
+
+impl App {
+    fn ws(&self) -> &Workspace {
+        &self.workspaces[self.active]
+    }
+
+    fn ws_mut(&mut self) -> &mut Workspace {
+        &mut self.workspaces[self.active]
+    }
+
+    /// Resolve a workspace index for delivery: explicit tag wins, detached
+    /// producers (watcher, local commands) land on the active workspace.
+    fn deliver_ws(&self, ws: Option<usize>) -> usize {
+        ws.filter(|&i| i < self.workspaces.len())
+            .unwrap_or(self.active)
+    }
+
+    fn switch_workspace(&mut self, dir: i32) {
+        if self.workspaces.is_empty() {
+            return;
+        }
+        let n = self.workspaces.len() as i32;
+        self.active = (self.active as i32 + dir).rem_euclid(n) as usize;
+        self.rebuild_proto();
+        self.status = format!("workspace → {}", self.workspaces[self.active].name);
+    }
+
+    fn new_workspace(&mut self) {
+        let n = self.workspaces.len() + 1;
+        self.workspaces.push(Workspace::new(format!("ws{n}")));
+        self.active = self.workspaces.len() - 1;
+        self.status = format!("workspace → ws{n}");
+    }
+}
+
+/// Popup submenu opened from the F-key bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MenuKind {
+    ImageModel,
+    SizePreset,
+    Steps,
+    Count,
+}
+
+#[derive(Debug, Clone)]
+struct Menu {
+    kind: MenuKind,
+    title: String,
+    items: Vec<String>,
+    selected: usize,
+}
+
+impl Menu {
+    fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn down(&mut self) {
+        if self.selected + 1 < self.items.len() {
+            self.selected += 1;
+        }
+    }
+}
+
+/// Push an image into a specific workspace (detached producers pass the
+/// index resolved by the caller).
+fn push_image_to(
+    app: &mut App,
+    target: usize,
+    label: String,
+    bytes: Vec<u8>,
+    generation: Option<Generation>,
+) {
+    if target >= app.workspaces.len() {
+        return;
+    }
+    let ws = &mut app.workspaces[target];
+    ws.gallery.push(GalleryItem {
+        label,
+        bytes,
+        generation,
+        proto: None,
+    });
+    ws.gidx = ws.gallery.len() - 1;
+    // Only the visible workspace pays for protocol encoding right away;
+    // background ones encode lazily when first shown.
+    let gidx = ws.gidx;
+    if target == app.active {
+        let cells = app.cells;
+        let proto = app.workspaces[target].gallery.get(gidx).and_then(|item| {
+            decode(&item.bytes)
+                .ok()
+                .and_then(|img| app.picker.new_protocol(img, cells, Resize::Fit(None)).ok())
+        });
+        if let Some(item) = app.workspaces[target].gallery.get_mut(gidx) {
+            item.proto = proto;
+        }
+    }
+}
+
+/// Rebuild the F2 model menu items from the cached checkpoint list,
+/// preselecting the active workspace's checkpoint.
+fn refresh_model_menu(app: &mut App) {
+    let ckpts = app.checkpoints.clone().unwrap_or_default();
+    let current = app.ws().settings.ckpt.clone();
+    let mut items = ckpts;
+    if items.is_empty() {
+        items.push("loading…".to_string());
+    }
+    let selected = items.iter().position(|c| c == &current).unwrap_or(0);
+    app.menu = Some(Menu {
+        kind: MenuKind::ImageModel,
+        title: "image model".to_string(),
+        items,
+        selected,
+    });
+}
+
+fn send_help(tx: &mpsc::UnboundedSender<UiMsg>) {
+    let _ = tx.send(UiMsg::Chat {
+        ws: None,
+        role: "sys".into(),
+        text: "/render TEXT [--w N --h N --steps N --n 1-4] · /models · /chat-model <id> · /cancel · ←/→ images · F1 help · F2 model · F3 size · F4 steps · F5 count · F6/F7 workspace · F8 new · /quit".into(),
+    });
+}
+
+/// Open the checkpoint menu, fetching the list in the background on first use.
+fn open_model_menu(app: &mut App, comfy: &Client, tx: &mpsc::UnboundedSender<UiMsg>) {
+    if app.checkpoints.is_none() {
+        let tx2 = tx.clone();
+        let c = comfy.clone();
+        tokio::spawn(async move {
+            let _ = tx2.send(UiMsg::Status("loading models…".into()));
+            if c.wait_ready(Duration::from_secs(420), |_| {})
+                .await
+                .is_err()
+            {
+                let _ = tx2.send(UiMsg::Error("ComfyUI did not wake up".into()));
+                return;
+            }
+            match c.checkpoints().await {
+                Ok(list) => {
+                    let _ = tx2.send(UiMsg::Checkpoints(list));
+                }
+                Err(e) => {
+                    let _ = tx2.send(UiMsg::Error(format!("models: {e:#}")));
+                }
+            }
+        });
+    }
+    refresh_model_menu(app);
+}
+
+fn open_size_menu(app: &mut App) {
+    let names: Vec<String> = PRESETS
+        .iter()
+        .map(|(name, w, h, steps)| format!("{name} — {w}x{h}, {steps} steps"))
+        .collect();
+    app.menu = Some(Menu {
+        kind: MenuKind::SizePreset,
+        title: "size preset".to_string(),
+        items: names,
+        selected: app.ws().settings.preset.min(PRESETS.len() - 1),
+    });
+}
+
+fn open_steps_menu(app: &mut App) {
+    let items = [4u32, 8, 14, 20, 30]
+        .iter()
+        .map(|s| format!("{s} steps"))
+        .collect::<Vec<_>>();
+    let current = app.ws().settings.steps;
+    let selected = [4u32, 8, 14, 20, 30]
+        .iter()
+        .position(|&s| s == current)
+        .unwrap_or(1);
+    app.menu = Some(Menu {
+        kind: MenuKind::Steps,
+        title: "quality (steps)".to_string(),
+        items,
+        selected,
+    });
+}
+
+fn open_count_menu(app: &mut App) {
+    let items = ["1 image", "2 images", "3 images", "4 images"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    app.menu = Some(Menu {
+        kind: MenuKind::Count,
+        title: "batch count".to_string(),
+        items,
+        selected: (app.ws().settings.n.saturating_sub(1) as usize).min(3),
+    });
+}
+
+/// Apply the highlighted menu entry to the active workspace and close.
+fn apply_menu(app: &mut App) {
+    let Some(menu) = app.menu.take() else {
+        return;
+    };
+    let item = menu.items.get(menu.selected).cloned().unwrap_or_default();
+    if item == "loading…" {
+        app.menu = Some(menu);
+        return;
+    }
+    let ws = app.ws_mut();
+    match menu.kind {
+        MenuKind::ImageModel => {
+            ws.settings.ckpt = item.clone();
+            app.status = format!("image model → {}", short_ckpt(&item));
+        }
+        MenuKind::SizePreset => {
+            ws.settings.preset = menu.selected.min(PRESETS.len() - 1);
+            ws.settings.steps = PRESETS[ws.settings.preset].3;
+            app.status = format!("preset → {}", ws.settings.describe());
+        }
+        MenuKind::Steps => {
+            ws.settings.steps = [4u32, 8, 14, 20, 30][menu.selected.min(4)];
+            app.status = format!("steps → {}", ws.settings.steps);
+        }
+        MenuKind::Count => {
+            ws.settings.n = (menu.selected as u32 + 1).clamp(1, 4);
+            app.status = format!("count → n={}", ws.settings.n);
+        }
+    }
 }
 
 pub async fn run() -> Result<()> {
@@ -79,14 +341,21 @@ fn is_wide(area: Rect) -> bool {
     area.width >= 100
 }
 
-/// Split main area into (image, chat) with one breathing cell between them.
-/// Wide screens go 80/20 side by side, narrow ones stack image over chat.
-fn split(area: Rect) -> (Rect, Rect) {
+/// Terminal cells are taller than wide (~1:2), so one gap column is only
+/// half a gap row in pixels. This returns how many columns equal one row,
+/// keeping horizontal and vertical whitespace the same size on screen.
+fn hgap_cols(font: FontSize) -> u16 {
+    let (w, h) = (font.width.max(1) as u32, font.height.max(1) as u32);
+    ((h + w / 2) / w).clamp(1, 8) as u16
+}
+
+/// Split main area into (image, chat) with pixel-matched breathing room.
+fn split(area: Rect, hgap: u16) -> (Rect, Rect) {
     if is_wide(area) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(80), Constraint::Percentage(20)])
-            .spacing(1)
+            .spacing(hgap)
             .split(area);
         (cols[0], cols[1])
     } else {
@@ -102,22 +371,31 @@ fn split(area: Rect) -> (Rect, Rect) {
 /// All pane rectangles, computed once per frame from the same math so the
 /// image protocol size always matches what is actually drawn.
 struct Areas {
+    header: Rect,
     pic: Rect,
     prov: Rect,
     settings: Rect,
+    models: Rect,
     chat_msgs: Rect,
     chat_input: Rect,
+    fkeys: Rect,
     status: Rect,
 }
 
-fn layout_areas(area: Rect) -> Areas {
-    let outer = area.inner(Margin::new(1, 1));
+fn layout_areas(area: Rect, font: FontSize) -> Areas {
+    let hgap = hgap_cols(font);
+    let outer = area.inner(Margin::new(hgap, 1));
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .spacing(1)
         .split(outer);
-    let (img_col, chat_col) = split(rows[0]);
+    let (img_col, chat_col) = split(rows[1], hgap);
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -129,16 +407,23 @@ fn layout_areas(area: Rect) -> Areas {
         .split(img_col);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(0),
+            Constraint::Length(3),
+        ])
         .spacing(1)
         .split(chat_col);
     Areas {
+        header: rows[0],
         pic: left[0],
         prov: left[1],
         settings: left[2],
-        chat_msgs: right[0],
-        chat_input: right[1],
-        status: rows[1],
+        models: right[0],
+        chat_msgs: right[1],
+        chat_input: right[2],
+        fkeys: rows[2],
+        status: rows[3],
     }
 }
 
@@ -178,6 +463,7 @@ struct RenderSettings {
     preset: usize,
     steps: u32,
     n: u32,
+    ckpt: String,
 }
 
 impl Default for RenderSettings {
@@ -186,6 +472,7 @@ impl Default for RenderSettings {
             preset: 0,
             steps: PRESETS[0].3,
             n: 1,
+            ckpt: comfy::DEFAULT_CKPT.to_string(),
         }
     }
 }
@@ -258,8 +545,8 @@ impl RenderSettings {
     }
 }
 
-fn gallery_cells(area: Rect) -> Size {
-    let a = layout_areas(area);
+fn gallery_cells(area: Rect, font: FontSize) -> Size {
+    let a = layout_areas(area, font);
     Size::new(
         a.pic.width.saturating_sub(2),
         a.pic.height.saturating_sub(2),
@@ -272,39 +559,49 @@ fn decode(bytes: &[u8]) -> Result<image::DynamicImage> {
 
 impl App {
     fn rebuild_proto(&mut self) {
-        if let Some(item) = self.gallery.get_mut(self.gidx) {
-            item.proto = decode(&item.bytes).ok().and_then(|img| {
-                self.picker
-                    .new_protocol(img, self.cells, Resize::Fit(None))
-                    .ok()
-            });
+        let gidx = self.ws().gidx;
+        if let Some(item) = self.ws_mut().gallery.get_mut(gidx) {
+            item.proto = None;
         }
-    }
-
-    fn push_image(&mut self, label: String, bytes: Vec<u8>, generation: Option<Generation>) {
-        self.gallery.push(GalleryItem {
-            label,
-            bytes,
-            generation,
-            proto: None,
-        });
-        self.gidx = self.gallery.len() - 1;
-        self.rebuild_proto();
+        // Rebuild in two steps to satisfy the borrow checker.
+        let cells = self.cells;
+        let proto = self
+            .ws()
+            .gallery
+            .get(gidx)
+            .and_then(|item| decode(&item.bytes).ok())
+            .and_then(|img| self.picker.new_protocol(img, cells, Resize::Fit(None)).ok());
+        if let Some(item) = self.ws_mut().gallery.get_mut(gidx) {
+            item.proto = proto;
+        }
     }
 
     fn step_history(&mut self, dir: i32) {
-        if self.gallery.is_empty() {
+        if self.ws().gallery.is_empty() {
             return;
         }
-        let n = self.gallery.len() as i32;
-        self.gidx = (self.gidx as i32 + dir).rem_euclid(n) as usize;
-        let cells = self.cells;
-        if let Some(item) = self.gallery.get_mut(self.gidx)
-            && item.proto.is_none()
+        let n = self.ws().gallery.len() as i32;
         {
-            item.proto = decode(&item.bytes)
-                .ok()
+            let ws = self.ws_mut();
+            ws.gidx = (ws.gidx as i32 + dir).rem_euclid(n) as usize;
+        }
+        let cells = self.cells;
+        let gidx = self.ws().gidx;
+        let needs_encode = self
+            .ws()
+            .gallery
+            .get(gidx)
+            .is_some_and(|item| item.proto.is_none());
+        if needs_encode {
+            let proto = self
+                .ws()
+                .gallery
+                .get(gidx)
+                .and_then(|item| decode(&item.bytes).ok())
                 .and_then(|img| self.picker.new_protocol(img, cells, Resize::Fit(None)).ok());
+            if let Some(item) = self.ws_mut().gallery.get_mut(gidx) {
+                item.proto = proto;
+            }
         }
     }
 }
@@ -316,6 +613,7 @@ async fn run_inner() -> Result<()> {
     let full = Rect::new(0, 0, size.width, size.height);
 
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let font = picker.font_size();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let comfy = Client::new(
         &std::env::var("CCTI_COMFY_URL").unwrap_or_else(|_| comfy::DEFAULT_BASE.into()),
@@ -341,17 +639,21 @@ async fn run_inner() -> Result<()> {
     }
 
     let mut app = App {
-        chat: vec![("sys".into(), "ccti ready. Type text for the agent, or /render <prompt> for a direct render. /help lists commands.".into())],
+        workspaces: vec![Workspace::new("main".to_string())],
+        active: 0,
         input: String::new(),
         status: "starting…".into(),
-        gallery: Vec::new(),
-        gidx: 0,
         picker,
         busy: false,
         agent_offline: false,
-        cells: gallery_cells(full),
-        settings: RenderSettings::default(),
+        cells: gallery_cells(full, font),
+        menu: None,
+        checkpoints: None,
     };
+    app.ws_mut().chat.push((
+        "sys".into(),
+        "ccti ready. Type text for the agent, /render <prompt> to render, F1 for keys.".into(),
+    ));
     let mut events = EventStream::new();
 
     loop {
@@ -360,15 +662,43 @@ async fn run_inner() -> Result<()> {
             msg = ui_rx.recv() => {
                 let Some(msg) = msg else { break };
                 match msg {
-                    UiMsg::Chat { role, text } => {
+                    UiMsg::Chat { ws, role, text } => {
+                        let target = app.deliver_ws(ws);
                         for chunk in split_long(&text) {
-                            app.chat.push((role.clone(), chunk));
+                            app.workspaces[target].chat.push((role.clone(), chunk));
                         }
                     }
                     UiMsg::Status(s) => app.status = s,
-                    UiMsg::Image { label, bytes, generation } => {
-                        app.push_image(label.clone(), bytes, generation);
-                        app.chat.push(("sys".into(), format!("image: {label}")));
+                    UiMsg::Image {
+                        ws,
+                        label,
+                        bytes,
+                        generation,
+                    } => {
+                        let target = app.deliver_ws(ws);
+                        let label2 = label.clone();
+                        push_image_to(&mut app, target, label, bytes, generation);
+                        app.workspaces[target]
+                            .chat
+                            .push(("sys".into(), format!("image: {label2}")));
+                    }
+                    UiMsg::Checkpoints(list) => {
+                        app.checkpoints = Some(list);
+                        if let Some(menu) = app.menu.as_mut()
+                            && menu.kind == MenuKind::ImageModel
+                        {
+                            refresh_model_menu(&mut app);
+                        }
+                        app.status = "models loaded".into();
+                    }
+                    UiMsg::ChatModel { ws, model } => {
+                        if let Some(w) = app.workspaces.get_mut(ws) {
+                            w.chat_model = Some(model.clone());
+                            w.chat.push((
+                                "sys".into(),
+                                format!("chat model → {model}"),
+                            ));
+                        }
                     }
                     UiMsg::AgentBusy(b) => {
                         app.busy = b;
@@ -379,7 +709,7 @@ async fn run_inner() -> Result<()> {
                     }
                     UiMsg::Error(e) => {
                         if e.contains("agent offline") { app.agent_offline = true; }
-                        app.chat.push(("err".into(), e.clone()));
+                        app.ws_mut().chat.push(("err".into(), e.clone()));
                         app.status = e;
                     }
                 }
@@ -390,6 +720,32 @@ async fn run_inner() -> Result<()> {
                     Event::Key(k) => {
                         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('d')) {
                             break;
+                        }
+                        // Menu modal first: arrows/enter/esc/F-keys drive it,
+                        // typing dismisses it and falls through to input.
+                        if app.menu.is_some() {
+                            match k.code {
+                                KeyCode::Up => app.menu.as_mut().unwrap().up(),
+                                KeyCode::Down => app.menu.as_mut().unwrap().down(),
+                                KeyCode::Enter => apply_menu(&mut app),
+                                KeyCode::Esc => {
+                                    app.menu = None;
+                                    app.status = "ready".into();
+                                }
+                                KeyCode::F(1) => send_help(&ui_tx),
+                                KeyCode::F(2) => open_model_menu(&mut app, &comfy, &ui_tx),
+                                KeyCode::F(3) => open_size_menu(&mut app),
+                                KeyCode::F(4) => open_steps_menu(&mut app),
+                                KeyCode::F(5) => open_count_menu(&mut app),
+                                KeyCode::Char(_) => {
+                                    app.menu = None;
+                                }
+                                _ => {}
+                            }
+                            // Chars fall through to normal typing below.
+                            if !matches!(k.code, KeyCode::Char(_)) {
+                                continue;
+                            }
                         }
                         match k.code {
                             KeyCode::Enter => {
@@ -402,17 +758,20 @@ async fn run_inner() -> Result<()> {
                             KeyCode::Char(c) => {
                                 // Settings keys act only on an empty input
                                 // line, so typing prompts never misfires.
-                                if app.input.is_empty()
-                                    && let Some(msg) = app.settings.apply_key(c)
-                                {
+                                let applied = if app.input.is_empty() {
+                                    app.ws_mut().settings.apply_key(c)
+                                } else {
+                                    None
+                                };
+                                if let Some(msg) = applied {
                                     app.status = msg;
                                 } else {
                                     app.input.push(c);
                                 }
                             }
                             KeyCode::Tab if app.input.is_empty() => {
-                                app.settings.cycle_count();
-                                app.status = format!("count → n={}", app.settings.n);
+                                app.ws_mut().settings.cycle_count();
+                                app.status = format!("count → n={}", app.ws().settings.n);
                             }
                             KeyCode::Backspace => { app.input.pop(); }
                             KeyCode::Esc => {
@@ -421,12 +780,21 @@ async fn run_inner() -> Result<()> {
                             }
                             KeyCode::Left if app.input.is_empty() => app.step_history(-1),
                             KeyCode::Right if app.input.is_empty() => app.step_history(1),
+                            KeyCode::F(1) => send_help(&ui_tx),
+                            KeyCode::F(2) => open_model_menu(&mut app, &comfy, &ui_tx),
+                            KeyCode::F(3) => open_size_menu(&mut app),
+                            KeyCode::F(4) => open_steps_menu(&mut app),
+                            KeyCode::F(5) => open_count_menu(&mut app),
+                            KeyCode::F(6) => app.switch_workspace(-1),
+                            KeyCode::F(7) => app.switch_workspace(1),
+                            KeyCode::F(8) => app.new_workspace(),
                             _ => {}
                         }
                     }
                     Event::Resize(_, _) => {
                         let s = term.size()?;
-                        app.cells = gallery_cells(Rect::new(0, 0, s.width, s.height));
+                        let font = app.picker.font_size();
+                        app.cells = gallery_cells(Rect::new(0, 0, s.width, s.height), font);
                         app.rebuild_proto();
                     }
                     _ => {}
@@ -537,21 +905,86 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Header content line: title left, workspace tabs middle, agent state right.
+fn header_line(
+    width: usize,
+    workspaces: &[Workspace],
+    active: usize,
+    agent_ok: bool,
+) -> RLine<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let mut spans = vec![Span::styled(
+        "CCTI - Corbet ComfyUi Terminal Interface",
+        Style::default().fg(Color::Cyan),
+    )];
+    let mut used = "CCTI - Corbet ComfyUi Terminal Interface".width() + 3;
+    spans.push(Span::raw("   "));
+    for (i, ws) in workspaces.iter().enumerate() {
+        let tab = format!("[{} {}]", i + 1, ws.name);
+        if used + tab.width() + 3 > width.saturating_sub(14) && i != active {
+            continue; // squeeze out inactive tabs first on narrow screens
+        }
+        used += tab.width() + 1;
+        if i == active {
+            spans.push(Span::styled(
+                format!("{tab} "),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!("{tab} "),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    let right = if agent_ok { "● agent" } else { "○ offline" };
+    let pad = width.saturating_sub(used + right.width() + 2);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(
+        right.to_string(),
+        Style::default().fg(if agent_ok { Color::Green } else { Color::Red }),
+    ));
+    RLine::from(spans)
+}
+
+fn fkey_bar() -> String {
+    "F1 help · F2 model · F3 size · F4 steps · F5 batch · F6/F7 workspace · F8 new".to_string()
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
-    let a = layout_areas(f.area());
-    let title = if app.gallery.is_empty() {
+    let a = layout_areas(f.area(), app.picker.font_size());
+    let ws = app.ws();
+
+    f.render_widget(Block::default().borders(Borders::ALL), a.header);
+    let inner_w = a.header.width.saturating_sub(2) as usize;
+    f.render_widget(
+        Paragraph::new(header_line(
+            inner_w,
+            &app.workspaces,
+            app.active,
+            !app.agent_offline,
+        )),
+        Rect {
+            x: a.header.x + 1,
+            y: a.header.y + 1,
+            width: a.header.width.saturating_sub(2),
+            height: 1,
+        },
+    );
+
+    let title = if ws.gallery.is_empty() {
         "image — nothing rendered yet".to_string()
     } else {
-        let item = &app.gallery[app.gidx];
+        let item = &ws.gallery[ws.gidx];
         format!(
             "image {}/{} — {} (←/→)",
-            app.gidx + 1,
-            app.gallery.len(),
+            ws.gidx + 1,
+            ws.gallery.len(),
             item.label
         )
     };
     f.render_widget(pic_block(title), a.pic);
-    if let Some(item) = app.gallery.get(app.gidx)
+    if let Some(item) = ws.gallery.get(ws.gidx)
         && let Some(proto) = &item.proto
     {
         let inner = Rect {
@@ -562,11 +995,7 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
         };
         f.render_widget(Image::new(proto), inner);
     }
-    let prov = prov_lines(
-        app.gallery
-            .get(app.gidx)
-            .and_then(|i| i.generation.as_ref()),
-    );
+    let prov = prov_lines(ws.gallery.get(ws.gidx).and_then(|i| i.generation.as_ref()));
     f.render_widget(
         Paragraph::new(prov.join("\n"))
             .block(prov_block())
@@ -574,14 +1003,28 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
         a.prov,
     );
     f.render_widget(
-        Paragraph::new(app.settings.lines().join("\n")).block(settings_block()),
+        Paragraph::new(ws.settings.lines().join("\n")).block(settings_block()),
         a.settings,
+    );
+
+    // Right column: per-workspace models on top, then chat.
+    let chat_model = ws
+        .chat_model
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    f.render_widget(
+        Paragraph::new(vec![
+            RLine::from(format!("image AI: {}", short_ckpt(&ws.settings.ckpt))),
+            RLine::from(format!("chat AI:  {chat_model}")),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("models")),
+        a.models,
     );
 
     // Chat pane (right, ~20).
     let w = a.chat_msgs.width.saturating_sub(2).max(10) as usize;
     let mut lines: Vec<RLine> = Vec::new();
-    for (role, text) in &app.chat {
+    for (role, text) in &ws.chat {
         let color = match role.as_str() {
             "you" => Color::Green,
             "agent" => Color::Cyan,
@@ -622,8 +1065,53 @@ fn draw(f: &mut ratatui::Frame<'_>, app: &mut App) {
     let input = Paragraph::new(format!("{prompt} {}", app.input)).block(input_block());
     f.render_widget(input, a.chat_input);
 
+    let fkeys = Paragraph::new(fkey_bar()).style(Style::default().fg(Color::DarkGray));
+    f.render_widget(fkeys, a.fkeys);
     let status = Paragraph::new(app.status.clone()).style(Style::default().fg(Color::DarkGray));
     f.render_widget(status, a.status);
+
+    if let Some(menu) = &app.menu {
+        render_menu(f, f.area(), menu);
+    }
+}
+
+/// Centered popup submenu.
+fn render_menu(f: &mut ratatui::Frame<'_>, area: Rect, menu: &Menu) {
+    let width = 46u16.min(area.width.saturating_sub(4)).max(20);
+    let height = (menu.items.len() as u16 + 4)
+        .min(area.height.saturating_sub(4))
+        .max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let mut lines = Vec::new();
+    for (i, item) in menu.items.iter().enumerate() {
+        if i == menu.selected {
+            lines.push(RLine::from(Span::styled(
+                format!("> {item}"),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            )));
+        } else {
+            lines.push(RLine::from(format!("  {item}")));
+        }
+    }
+    lines.push(RLine::from(""));
+    lines.push(RLine::from(Span::styled(
+        "↑↓ navigate · Enter select · Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(menu.title.clone()),
+        ),
+        popup,
+    );
 }
 
 /// Local slash commands. Returns false to quit.
@@ -639,8 +1127,9 @@ fn handle_command(
         if app.agent_offline {
             let _ = tx.send(UiMsg::Error("agent offline — use /render <prompt>".into()));
         } else {
-            agent.prompt(line.to_string());
+            agent.prompt(line.to_string(), app.active);
             let _ = tx.send(UiMsg::Chat {
+                ws: None,
                 role: "you".into(),
                 text: line.to_string(),
             });
@@ -651,8 +1140,8 @@ fn handle_command(
     match parts.next().unwrap_or("") {
         "quit" | "q" => return false,
         "help" | "h" => {
-            let _ = tx.send(UiMsg::Chat { role: "sys".into(), text:
-                "/render TEXT [--w N --h N --steps N --n 1-4] direct render (fast defaults: 512px, 8 steps) · /models list checkpoints · /cancel stop agent turn · ←/→ image history · /quit".into() });
+            let _ = tx.send(UiMsg::Chat { ws: None, role: "sys".into(), text:
+                "/render TEXT [--w N --h N --steps N --n 1-4] direct render (settings box defaults) · /models list checkpoints · /chat-model <id> switch chat model · /cancel stop agent turn · ←/→ images · F1 keys · F2 model · F3 size · F4 steps · F5 count · F6/F7 workspace · F8 new · /quit".into() });
         }
         "cancel" => agent.cancel(),
         "models" => {
@@ -671,7 +1160,9 @@ fn handle_command(
                 }
                 match c.checkpoints().await {
                     Ok(list) => {
+                        let _ = tx.send(UiMsg::Checkpoints(list.clone()));
                         let _ = tx.send(UiMsg::Chat {
+                            ws: None,
                             role: "sys".into(),
                             text: list.join(", "),
                         });
@@ -691,17 +1182,26 @@ fn handle_command(
                 ));
                 return true;
             }
-            let (prompt, w, h, steps, n) = args.resolve(&app.settings);
+            let r = args.resolve(&app.ws().settings);
             let tx2 = tx.clone();
             let c = comfy.clone();
-            let prompt2 = prompt.clone();
             tokio::spawn(async move {
-                direct_render(&c, &tx2, &prompt2, w, h, steps, n).await;
+                direct_render(&c, &tx2, r).await;
             });
             let _ = tx.send(UiMsg::Chat {
+                ws: None,
                 role: "you".into(),
-                text: format!("/render {prompt}"),
+                text: format!("/render {}", args.prompt),
             });
+        }
+        "chat-model" => {
+            let id = line[12..].trim().to_string();
+            if id.is_empty() {
+                let _ = tx.send(UiMsg::Error("usage: /chat-model <model-id>".into()));
+                return true;
+            }
+            agent.set_chat_model(app.active, id);
+            let _ = tx.send(UiMsg::Status("requesting chat model…".into()));
         }
         other => {
             let _ = tx.send(UiMsg::Error(format!("unknown /{other} — /help")));
@@ -721,16 +1221,29 @@ struct RenderArgs {
     n: Option<u32>,
 }
 
+/// Fully resolved render parameters: explicit flags win, the live
+/// settings box (including its image model) supplies the rest.
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedRender {
+    prompt: String,
+    w: u32,
+    h: u32,
+    steps: u32,
+    n: u32,
+    ckpt: String,
+}
+
 impl RenderArgs {
-    fn resolve(&self, settings: &RenderSettings) -> (String, u32, u32, u32, u32) {
+    fn resolve(&self, settings: &RenderSettings) -> ResolvedRender {
         let (dw, dh) = settings.dims();
-        (
-            self.prompt.clone(),
-            self.w.unwrap_or(dw),
-            self.h.unwrap_or(dh),
-            self.steps.unwrap_or(settings.steps),
-            self.n.unwrap_or(settings.n),
-        )
+        ResolvedRender {
+            prompt: self.prompt.clone(),
+            w: self.w.unwrap_or(dw),
+            h: self.h.unwrap_or(dh),
+            steps: self.steps.unwrap_or(settings.steps),
+            n: self.n.unwrap_or(settings.n),
+            ckpt: settings.ckpt.clone(),
+        }
     }
 }
 
@@ -762,15 +1275,15 @@ fn parse_render(rest: &str) -> RenderArgs {
     }
 }
 
-async fn direct_render(
-    c: &Client,
-    tx: &mpsc::UnboundedSender<UiMsg>,
-    prompt: &str,
-    w: u32,
-    h: u32,
-    steps: u32,
-    n: u32,
-) {
+async fn direct_render(c: &Client, tx: &mpsc::UnboundedSender<UiMsg>, r: ResolvedRender) {
+    let ResolvedRender {
+        prompt,
+        w,
+        h,
+        steps,
+        n,
+        ckpt,
+    } = r;
     let send = |m: UiMsg| {
         let _ = tx.send(m);
     };
@@ -788,8 +1301,8 @@ async fn direct_render(
     let refs = match c
         .render(
             comfy::RenderOpts {
-                prompt,
-                ckpt: comfy::DEFAULT_CKPT,
+                prompt: &prompt,
+                ckpt: &ckpt,
                 width: w,
                 height: h,
                 steps,
@@ -814,9 +1327,9 @@ async fn direct_render(
     let dir = std::path::PathBuf::from(format!("{home}/images/generated"));
     for (i, img) in refs.iter().enumerate() {
         let generation = Generation {
-            prompt: prompt.to_string(),
+            prompt: prompt.clone(),
             negative: "blurry, watermark, text, deformed".to_string(),
-            ckpt: comfy::DEFAULT_CKPT.to_string(),
+            ckpt: ckpt.clone(),
             width: w,
             height: h,
             steps,
@@ -834,6 +1347,7 @@ async fn direct_render(
                 let stem = format!("ccti_{ts}_{i}");
                 match prov::store_rendered(&dir, &stem, &bytes, &generation) {
                     Ok((png_path, _)) => send(UiMsg::Image {
+                        ws: None,
                         label: png_path.display().to_string(),
                         bytes,
                         generation: Some(generation),
@@ -874,6 +1388,7 @@ async fn watch_renders(tx: mpsc::UnboundedSender<UiMsg>) {
                     let json_path = ent.path().with_extension("json");
                     let generation = Generation::load_sidecar(&json_path).ok();
                     let _ = tx.send(UiMsg::Image {
+                        ws: None,
                         label: name,
                         bytes,
                         generation,
@@ -888,18 +1403,30 @@ async fn watch_renders(tx: mpsc::UnboundedSender<UiMsg>) {
 mod tests {
     use super::*;
 
+    fn push_image_to_active(
+        app: &mut App,
+        label: String,
+        bytes: Vec<u8>,
+        generation: Option<Generation>,
+    ) {
+        let target = app.active;
+        push_image_to(app, target, label, bytes, generation);
+    }
+
     fn test_app() -> App {
+        let mut ws = Workspace::new("main".to_string());
+        ws.chat = Vec::new();
         App {
-            chat: Vec::new(),
+            workspaces: vec![ws],
+            active: 0,
             input: String::new(),
             status: String::new(),
-            gallery: Vec::new(),
-            gidx: 0,
             picker: Picker::halfblocks(),
             busy: false,
             agent_offline: false,
             cells: Size::new(80, 24),
-            settings: RenderSettings::default(),
+            menu: None,
+            checkpoints: None,
         }
     }
 
@@ -916,16 +1443,16 @@ mod tests {
 
     #[test]
     fn wide_screens_split_80_20_side_by_side() {
-        let (img, chat) = split(Rect::new(0, 0, 120, 40));
-        // 119 cells for panes + 1 gap cell.
-        assert_eq!(img.width + chat.width, 119);
+        let (img, chat) = split(Rect::new(0, 0, 120, 40), 2);
+        // 118 cells for panes + 2 gap cells.
+        assert_eq!(img.width + chat.width, 118);
         assert_eq!(img.height, chat.height);
-        assert_eq!(chat.x, img.x + img.width + 1);
+        assert_eq!(chat.x, img.x + img.width + 2);
     }
 
     #[test]
     fn narrow_screens_stack_image_over_chat() {
-        let (img, chat) = split(Rect::new(0, 0, 80, 40));
+        let (img, chat) = split(Rect::new(0, 0, 80, 40), 2);
         assert_eq!(img.width, 80);
         // 39 cells for panes + 1 gap cell.
         assert_eq!(img.height + chat.height, 39);
@@ -933,17 +1460,76 @@ mod tests {
     }
 
     #[test]
+    fn hgap_matches_pixels_not_cells() {
+        use ratatui_image::FontSize;
+        // Classic 1:2 terminal cell: two columns equal one row.
+        assert_eq!(hgap_cols(FontSize::new(8, 16)), 2);
+        assert_eq!(hgap_cols(FontSize::new(10, 20)), 2);
+        assert_eq!(hgap_cols(FontSize::new(9, 18)), 2);
+        // Square-ish cells collapse to a single column.
+        assert_eq!(hgap_cols(FontSize::new(8, 8)), 1);
+        // Degenerate input never yields zero.
+        assert_eq!(hgap_cols(FontSize::new(0, 0)), 1);
+    }
+
+    #[test]
     fn history_walks_and_wraps() {
         let mut app = test_app();
         app.step_history(1); // empty: no panic, no move
-        assert_eq!(app.gidx, 0);
-        app.push_image("a".into(), test_png(), None);
-        app.push_image("b".into(), test_png(), None);
-        assert_eq!(app.gidx, 1);
+        assert_eq!(app.ws().gidx, 0);
+        push_image_to_active(&mut app, "a".into(), test_png(), None);
+        push_image_to_active(&mut app, "b".into(), test_png(), None);
+        assert_eq!(app.ws().gidx, 1);
         app.step_history(1);
-        assert_eq!(app.gidx, 0);
+        assert_eq!(app.ws().gidx, 0);
         app.step_history(-1);
-        assert_eq!(app.gidx, 1);
+        assert_eq!(app.ws().gidx, 1);
+    }
+
+    #[test]
+    fn workspaces_switch_and_stay_isolated() {
+        let mut app = test_app();
+        push_image_to_active(&mut app, "a".into(), test_png(), None);
+        app.new_workspace();
+        assert_eq!(app.active, 1);
+        assert_eq!(app.ws().name, "ws2");
+        assert!(app.ws().gallery.is_empty());
+        app.switch_workspace(-1);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.ws().gallery.len(), 1);
+        app.switch_workspace(1);
+        assert_eq!(app.active, 1);
+        app.switch_workspace(9); // wraps around two workspaces
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn menu_navigation_clamps_at_ends() {
+        let mut m = Menu {
+            kind: MenuKind::Count,
+            title: "x".to_string(),
+            items: vec!["1".to_string(), "2".to_string()],
+            selected: 0,
+        };
+        m.up();
+        assert_eq!(m.selected, 0);
+        m.down();
+        m.down();
+        assert_eq!(m.selected, 1);
+    }
+
+    #[test]
+    fn apply_menu_writes_active_workspace_settings() {
+        let mut app = test_app();
+        app.menu = Some(Menu {
+            kind: MenuKind::Count,
+            title: "x".to_string(),
+            items: vec!["1 image".to_string(), "2 images".to_string()],
+            selected: 1,
+        });
+        apply_menu(&mut app);
+        assert_eq!(app.ws().settings.n, 2);
+        assert!(app.menu.is_none());
     }
 
     fn args(
@@ -996,20 +1582,16 @@ mod tests {
     #[test]
     fn resolve_prefers_flags_over_settings() {
         let settings = RenderSettings::default(); // Fast 512, 8 steps, n=1
-        assert_eq!(
-            parse_render("a fox").resolve(&settings),
-            ("a fox".to_string(), 512, 512, 8, 1)
-        );
-        assert_eq!(
-            parse_render("a fox --w 1024 --n 2").resolve(&settings),
-            ("a fox".to_string(), 1024, 512, 8, 2)
-        );
+        let r = parse_render("a fox").resolve(&settings);
+        assert_eq!(r.prompt, "a fox");
+        assert_eq!((r.w, r.h, r.steps, r.n), (512, 512, 8, 1));
+        assert_eq!(r.ckpt, comfy::DEFAULT_CKPT);
+        let r = parse_render("a fox --w 1024 --n 2").resolve(&settings);
+        assert_eq!((r.w, r.h, r.steps, r.n), (1024, 512, 8, 2));
         let mut quality = RenderSettings::default();
         quality.cycle_preset(2); // Quality 1024, 20 steps
-        assert_eq!(
-            parse_render("a fox").resolve(&quality),
-            ("a fox".to_string(), 1024, 1024, 20, 1)
-        );
+        let r = parse_render("a fox").resolve(&quality);
+        assert_eq!((r.w, r.h, r.steps, r.n), (1024, 1024, 20, 1));
     }
 
     #[test]
@@ -1070,7 +1652,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let mut app = test_app();
         app.cells = Size::new(90, 20);
-        app.chat.push((
+        app.ws_mut().chat.push((
             "agent".into(),
             "Größe prüfen: ein äußerst langes deutsches Wort wie Donaudampfschifffahrtsgesellschaft und 日本語混じり".into(),
         ));
@@ -1090,7 +1672,7 @@ mod tests {
             software: "ccti".into(),
             created_unix: 1,
         };
-        app.push_image("test".into(), test_png(), Some(generation));
+        push_image_to_active(&mut app, "test".into(), test_png(), Some(generation));
         let backend = TestBackend::new(120, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1123,13 +1705,25 @@ mod tests {
         );
         assert!(flat.contains("Größe prüfen"), "chat lost in render");
         assert!(flat.contains("provenance"), "panel title lost");
+        assert!(
+            flat.contains("CCTI - Corbet ComfyUi Terminal Interface"),
+            "header title lost"
+        );
+        assert!(flat.contains("[1 main]"), "workspace tab lost");
+        assert!(flat.contains("image AI:"), "models box lost");
+        assert!(flat.contains("F2 model"), "fkey bar lost");
         // Horizontal seam between picture and provenance is a single line:
         // recompute the layout and check the provenance top row has no ─ run.
         let full = Rect::new(0, 0, 120, 39);
-        let (img_rect, _) = split(full);
+        let (img_rect, _) = split(full, 2);
         let left = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(8)])
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(8),
+                Constraint::Length(8),
+            ])
+            .spacing(1)
             .split(img_rect);
         let seam_y = left[1].y as usize;
         let mut seam = String::new();
@@ -1145,7 +1739,7 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let mut app = test_app();
         app.cells = Size::new(60, 12);
-        app.push_image("test".into(), test_png(), None);
+        push_image_to_active(&mut app, "test".into(), test_png(), None);
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1157,6 +1751,22 @@ mod tests {
             }
             assert!(!line.contains("││"), "doubled vertical on row {y}");
         }
+    }
+
+    #[test]
+    fn header_line_marks_active_tab_and_agent() {
+        let ws = vec![
+            Workspace::new("main".to_string()),
+            Workspace::new("portraits".to_string()),
+        ];
+        let line = header_line(100, &ws, 1, true);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("CCTI - Corbet ComfyUi Terminal Interface"));
+        assert!(text.contains("[2 portraits]"));
+        assert!(text.contains("● agent"));
+        let line = header_line(100, &ws, 0, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("○ offline"));
     }
 
     #[test]

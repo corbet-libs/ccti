@@ -41,7 +41,8 @@ it briefly, and offer tweaks. The cold start is handled inside the tool; \
 just wait for it. Answer in the user's language.";
 
 enum Cmd {
-    Prompt(String),
+    Prompt { ws: usize, text: String },
+    SetChatModel { ws: usize, model: String },
     Cancel,
 }
 
@@ -61,8 +62,12 @@ impl Agent {
         Ok(Self { tx })
     }
 
-    pub fn prompt(&self, text: String) {
-        let _ = self.tx.send(Cmd::Prompt(text));
+    pub fn prompt(&self, text: String, ws: usize) {
+        let _ = self.tx.send(Cmd::Prompt { ws, text });
+    }
+
+    pub fn set_chat_model(&self, ws: usize, model: String) {
+        let _ = self.tx.send(Cmd::SetChatModel { ws, model });
     }
 
     pub fn cancel(&self) {
@@ -127,6 +132,7 @@ async fn run_session(
     let mut seq = 0_u64;
     let mut req_no = 0_u64;
     let mut busy = false;
+    let mut turn_ws = 0_usize;
     let mut first = true;
     let mut buf = String::new();
     send(UiMsg::Status("agent connected".into()));
@@ -136,12 +142,13 @@ async fn run_session(
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    Cmd::Prompt(text) => {
+                    Cmd::Prompt { ws, text } => {
                         if busy {
                             send(UiMsg::Error("agent is busy (/cancel first)".into()));
                             continue;
                         }
                         busy = true;
+                        turn_ws = ws;
                         req_no += 1;
                         let request_id = format!("ccti-{req_no}");
                         let full = if first {
@@ -158,6 +165,16 @@ async fn run_session(
                             }
                         });
                         send(UiMsg::AgentBusy(true));
+                    }
+                    Cmd::SetChatModel { ws, model } => {
+                        match handle.set_model(&model).await {
+                            Ok(_) => {
+                                let _ = ui.send(UiMsg::ChatModel { ws, model });
+                            }
+                            Err(e) => {
+                                send(UiMsg::Error(format!("chat model switch failed: {e}")));
+                            }
+                        }
                     }
                     Cmd::Cancel => {
                         if let Err(e) = handle.cancel().await {
@@ -184,7 +201,7 @@ async fn run_session(
                         }
                         SessionUpdate::AgentThoughtChunk(_) => {}
                         SessionUpdate::ToolCall(tc) => {
-                            send(UiMsg::Chat { role: "tool".into(), text: format!("{} …", tc.title) });
+                            send(UiMsg::Chat { ws: Some(turn_ws), role: "tool".into(), text: format!("{} …", tc.title) });
                         }
                         SessionUpdate::ToolCallUpdate(u) => {
                             if let Some(title) = u.fields.title.as_deref() {
@@ -204,12 +221,12 @@ async fn run_session(
                         if handle.respond_permission(request_id, decision).await.is_err() {
                             send(UiMsg::Error("permission response failed".into()));
                         } else {
-                            send(UiMsg::Chat { role: "sys".into(), text: format!("permission {verdict}: {title}") });
+                            send(UiMsg::Chat { ws: Some(turn_ws), role: "sys".into(), text: format!("permission {verdict}: {title}") });
                         }
                     }
                     Event::Completed { .. } => {
                         if !buf.trim().is_empty() {
-                            send(UiMsg::Chat { role: "agent".into(), text: std::mem::take(&mut buf) });
+                            send(UiMsg::Chat { ws: Some(turn_ws), role: "agent".into(), text: std::mem::take(&mut buf) });
                         }
                         busy = false;
                         send(UiMsg::AgentBusy(false));

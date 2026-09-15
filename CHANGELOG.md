@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6 — 2026-09-15
+
+- Header bar (title, workspace tabs, agent state), multiple workspaces with
+  isolated galleries/chats/settings, per-workspace image + chat AI display.
+- F-key bar with submenus: model, size, steps, batch; F6/F7/F8 manage
+  workspaces. Pixel-matched gaps from the live font metrics.
+
 ## 0.1.5 — 2026-09-15
 
 - Breathing room: one-cell gaps plus outer margin between all panes; every
