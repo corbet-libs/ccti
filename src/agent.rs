@@ -375,10 +375,14 @@ async fn run_router(
                             send(UiMsg::Chat { ws: Some(ws), role: "agent".into(), text });
                         }
                         session.busy = false;
+                        // Snapshots number events per turn: restart at 1 so the
+                        // next turn's events pass the conversation gap check.
+                        session.seq = 0;
                         send(UiMsg::AgentBusy { ws, busy: any_busy(&sessions) });
                     }
                     Event::Error { code, message } => {
                         session.busy = false;
+                        session.seq = 0;
                         send(UiMsg::AgentBusy { ws, busy: any_busy(&sessions) });
                         send(UiMsg::Error(format!("{code}: {message}")));
                     }

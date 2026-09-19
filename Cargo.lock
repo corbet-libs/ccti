@@ -316,9 +316,9 @@ dependencies = [
 
 [[package]]
 name = "ccht"
-version = "0.2.1"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df998d0687c5ebbddb5fe9a3ecb37abc7ea27c7ebc3048be76ee3f02af4baea8"
+checksum = "14b8947331dc3a79b0d2694e8a3cbd438af0805d2594c2b8dd0ae9eac7b7c957"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-schema",
@@ -2549,6 +2549,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
