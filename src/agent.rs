@@ -1,21 +1,26 @@
-//! Agent side: one ccht native ACP session per workspace, created lazily
-//! on first use. Turns in different workspaces run in parallel
-//! automatically; each workspace serializes its own turns, and every chat
-//! line is tagged so late answers still land where they were asked.
+//! Agent side: chat turns through ccht's keyed [`SessionPool`].
 //!
-//! ccht owns session mechanics; ccti owns UI, tools (via bundled MCP
-//! server) and the permission policy below.
+//! Pool keys are workspace ids (`ws{index}`); each key owns exactly one
+//! session, created lazily on first use. Turns on different keys run in
+//! parallel, each key serializes its own turns, and every event arrives
+//! tagged so late answers still land where they were asked.
+//!
+//! ccht owns session mechanics (per-turn request identity, busy guards,
+//! conversation snapshots); ccti owns the UI, the first-turn prompt,
+//! tool wiring (bundled `--mcp` server per session) and the permission
+//! policy below.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use ccht::{
-    Conversation, Event, Prompt, SessionEvent, WireEvent,
+    Event,
     acp::{
-        ContentBlock, McpServer, McpServerStdio, PermissionOptionKind, RequestPermissionOutcome,
-        SelectedPermissionOutcome, SessionConfigSelectOptions, SessionUpdate,
+        McpServer, McpServerStdio, PermissionOptionKind, RequestPermissionOutcome,
+        SelectedPermissionOutcome, SessionUpdate,
     },
     native::{
-        AgentCommand, NativeClient, NativeOptions, PermissionPolicy, SessionHandle, SessionOptions,
+        AgentCommand, NativeError, NativeOptions, PermissionPolicy, PoolEvent, SessionOptions,
+        SessionPool,
     },
 };
 use tokio::sync::mpsc;
@@ -36,362 +41,264 @@ fn decide(request: &ccht::acp::RequestPermissionRequest) -> RequestPermissionOut
     RequestPermissionOutcome::Cancelled
 }
 
-/// Human-readable current model of a session configuration: the option
-/// label when resolvable, else the raw value id. Pure: unit-tested below.
-pub fn session_model_name(cfg: &ccht::SessionConfiguration) -> Option<String> {
-    let opt = cfg.model_option()?;
-    let ccht::acp::SessionConfigKind::Select(sel) = &opt.kind else {
-        return None;
-    };
-    let current = sel.current_value.to_string();
-    let label = match &sel.options {
-        SessionConfigSelectOptions::Ungrouped(opts) => opts
-            .iter()
-            .find(|o| o.value.to_string() == current)
-            .map(|o| o.name.clone()),
-        SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|g| &g.options)
-            .find(|o| o.value.to_string() == current)
-            .map(|o| o.name.clone()),
-        _ => None,
-    };
-    Some(label.unwrap_or(current))
-}
-
 /// Default chat model for new workspace sessions: vision-capable, so the
 /// agent can actually look at its renders instead of guessing from prompts.
 pub const DEFAULT_CHAT_MODEL: &str = "opencode-go/muse-spark-1.3-contributor";
 
-enum Cmd {
-    Prompt { ws: usize, text: String },
-    SetChatModel { ws: usize, model: String },
-    Cancel { ws: usize },
+/// Pool key for a workspace index. Pure: unit-tested below.
+fn pool_key(ws: usize) -> String {
+    format!("ws{ws}")
+}
+
+/// Workspace index back from a pool key, if it is one of ours.
+fn key_ws(key: &str) -> Option<usize> {
+    key.strip_prefix("ws")?.parse().ok()
+}
+
+/// Prompt text for a turn: the first turn of a session carries the system
+/// preamble (pool sessions are created on first use, so first-use implies
+/// first turn); later turns send the user text untouched. Pure: tested below.
+fn first_turn_text(first: bool, text: &str) -> String {
+    if first {
+        format!("{SYSTEM}\n\n{text}")
+    } else {
+        text.to_string()
+    }
 }
 
 pub struct Agent {
-    tx: mpsc::UnboundedSender<Cmd>,
-}
-
-impl Agent {
-    /// Connect the shared client and spawn the router. Sessions are created
-    /// lazily per workspace on first use.
-    pub async fn spawn(
-        exe_mcp: PathBuf,
-        cwd: PathBuf,
-        ui: mpsc::UnboundedSender<UiMsg>,
-    ) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let shared = Shared::connect(exe_mcp, cwd, ui.clone()).await?;
-        tokio::spawn(run_router(shared, rx, ui));
-        Ok(Self { tx })
-    }
-
-    pub fn prompt(&self, text: String, ws: usize) {
-        let _ = self.tx.send(Cmd::Prompt { ws, text });
-    }
-
-    pub fn set_chat_model(&self, ws: usize, model: String) {
-        let _ = self.tx.send(Cmd::SetChatModel { ws, model });
-    }
-
-    pub fn cancel(&self, ws: usize) {
-        let _ = self.tx.send(Cmd::Cancel { ws });
-    }
-}
-
-struct Shared {
-    client: Option<NativeClient>,
+    pool: SessionPool,
     exe_mcp: PathBuf,
     cwd: PathBuf,
     ui: mpsc::UnboundedSender<UiMsg>,
 }
 
-impl Shared {
-    async fn connect(
+impl Agent {
+    /// Connect the shared pool and spawn the event router.
+    pub async fn spawn(
         exe_mcp: PathBuf,
         cwd: PathBuf,
         ui: mpsc::UnboundedSender<UiMsg>,
     ) -> anyhow::Result<Self> {
-        let send = |m: UiMsg| {
-            let _ = ui.send(m);
-        };
-        let client = match NativeClient::connect(
+        let (pool, rx) = SessionPool::connect(
             AgentCommand::new("opencode").args(["acp"]),
             NativeOptions {
-                prompt_timeout: std::time::Duration::from_secs(1800),
+                prompt_timeout: Duration::from_secs(1800),
                 permissions: PermissionPolicy::Ask,
                 ..NativeOptions::default()
             },
         )
-        .await
-        {
-            Ok(c) => {
-                send(UiMsg::Status("agent connected".into()));
-                Some(c)
-            }
-            Err(e) => {
-                send(UiMsg::Error(format!(
-                    "agent offline ({e}); /render still works"
-                )));
-                None
-            }
-        };
+        .await;
+        tokio::spawn(run_router(pool.clone(), rx, ui.clone()));
         Ok(Self {
-            client,
+            pool,
             exe_mcp,
             cwd,
             ui,
         })
     }
+
+    pub fn prompt(&self, text: String, ws: usize) {
+        let pool = self.pool.clone();
+        let ui = self.ui.clone();
+        let exe_mcp = self.exe_mcp.clone();
+        let cwd = self.cwd.clone();
+        tokio::spawn(async move {
+            let key = pool_key(ws);
+            let first = !pool.has_session(&key).await;
+            let mut mcp = McpServerStdio::new("ccti-comfy", exe_mcp);
+            mcp.args = vec!["--mcp".to_string()];
+            // Only the first use consumes these: the pool creates the key's
+            // session from them once and reuses it for later turns.
+            let opts = SessionOptions {
+                cwd,
+                model: Some(DEFAULT_CHAT_MODEL.to_string()),
+                configuration: Vec::new(),
+                mcp_servers: vec![McpServer::Stdio(mcp)],
+            };
+            let _ = ui.send(UiMsg::AgentBusy { ws, busy: true });
+            match pool.prompt(&key, opts, first_turn_text(first, &text)).await {
+                Ok(()) => {
+                    let _ = ui.send(UiMsg::AgentDone);
+                }
+                Err(NativeError::Busy) => {
+                    let _ = ui.send(UiMsg::AgentBusy { ws, busy: false });
+                    let _ = ui.send(UiMsg::Error(format!(
+                        "ws{} is busy (/cancel first)",
+                        ws + 1
+                    )));
+                }
+                Err(NativeError::Closed) => {
+                    let _ = ui.send(UiMsg::AgentBusy { ws, busy: false });
+                    let _ = ui.send(UiMsg::Error(format!(
+                        "agent offline (ws{}); /render still works",
+                        ws + 1
+                    )));
+                }
+                Err(e) => {
+                    let _ = ui.send(UiMsg::AgentBusy { ws, busy: false });
+                    let _ = ui.send(UiMsg::Error(format!("prompt failed: {e}")));
+                }
+            }
+        });
+    }
+
+    pub fn set_chat_model(&self, ws: usize, model: String) {
+        let pool = self.pool.clone();
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            let key = pool_key(ws);
+            if !pool.has_session(&key).await {
+                let _ = ui.send(UiMsg::Error(format!(
+                    "no chat yet (ws{}) — send a message first",
+                    ws + 1
+                )));
+                return;
+            }
+            match pool.set_model(&key, &model).await {
+                Ok(cfg) => {
+                    let shown = cfg.model_display_name().unwrap_or(model.clone());
+                    let _ = ui.send(UiMsg::ChatModel { ws, model: shown });
+                }
+                Err(e) => {
+                    let _ = ui.send(UiMsg::Error(format!("chat model switch failed: {e}")));
+                }
+            }
+        });
+    }
+
+    pub fn cancel(&self, ws: usize) {
+        let pool = self.pool.clone();
+        let ui = self.ui.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pool.cancel(&pool_key(ws)).await {
+                let _ = ui.send(UiMsg::Error(format!("cancel failed: {e}")));
+            }
+        });
+    }
 }
 
-struct Session {
-    handle: SessionHandle,
-    conv: Conversation,
-    buf: String,
-    busy: bool,
-    first: bool,
-    seq: u64,
-    req_no: u64,
-}
-
+/// Route tagged pool events to UI messages. Assistant text is read back from
+/// the key's conversation snapshot (which the pool updates before re-emitting
+/// each event), so turns render as one message on completion instead of
+/// streamed fragments.
 async fn run_router(
-    shared: Shared,
-    mut cmds: mpsc::UnboundedReceiver<Cmd>,
+    pool: SessionPool,
+    mut rx: mpsc::UnboundedReceiver<PoolEvent>,
     ui: mpsc::UnboundedSender<UiMsg>,
 ) {
     let send = |m: UiMsg| {
         let _ = ui.send(m);
     };
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<(usize, Option<SessionEvent>)>();
-    let mut sessions: HashMap<usize, Session> = HashMap::new();
-
-    // Ensure a live session for ws, creating it (plus its event forwarder)
-    // on first use. Returns false when the backend is offline.
-    async fn ensure(
-        shared: &Shared,
-        sessions: &mut HashMap<usize, Session>,
-        ev_tx: &mpsc::UnboundedSender<(usize, Option<SessionEvent>)>,
-        ws: usize,
-    ) -> bool {
-        if sessions.contains_key(&ws) {
-            return true;
-        }
-        let Some(client) = &shared.client else {
-            shared
-                .ui
-                .send(UiMsg::Error(format!(
-                    "agent offline (ws{}); /render still works",
-                    ws + 1
-                )))
-                .ok();
-            return false;
-        };
-        let mut mcp = McpServerStdio::new("ccti-comfy", shared.exe_mcp.clone());
-        mcp.args = vec!["--mcp".to_string()];
-        let mut session = match client
-            .new_session(SessionOptions {
-                cwd: shared.cwd.clone(),
-                model: Some(DEFAULT_CHAT_MODEL.to_string()),
-                configuration: Vec::new(),
-                mcp_servers: vec![McpServer::Stdio(mcp)],
-            })
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                shared
-                    .ui
-                    .send(UiMsg::Error(format!("agent session failed: {e}")))
-                    .ok();
-                return false;
-            }
-        };
-        let handle = session.handle();
-        if let Some(model) = session_model_name(&handle.configuration()) {
-            shared.ui.send(UiMsg::SessionModel { ws, model }).ok();
-        }
-        let mut events = match session.take_events() {
-            Ok(rx) => rx,
-            Err(e) => {
-                shared
-                    .ui
-                    .send(UiMsg::Error(format!("agent events failed: {e}")))
-                    .ok();
-                return false;
-            }
-        };
-        drop(session);
-        let fwd = ev_tx.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = events.recv().await {
-                if fwd.send((ws, Some(ev))).is_err() {
-                    break;
+    let mut connected = false;
+    let mut announced: HashSet<String> = HashSet::new();
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            PoolEvent::Session { key, event } => {
+                if !connected {
+                    connected = true;
+                    send(UiMsg::Status("agent connected".into()));
                 }
-            }
-            let _ = fwd.send((ws, None));
-        });
-        sessions.insert(
-            ws,
-            Session {
-                handle,
-                conv: Conversation::new(format!("ccti-ws{ws}")),
-                buf: String::new(),
-                busy: false,
-                first: true,
-                seq: 0,
-                req_no: 0,
-            },
-        );
-        true
-    }
-
-    let any_busy = |sessions: &HashMap<usize, Session>| sessions.values().any(|s| s.busy);
-
-    loop {
-        tokio::select! {
-            cmd = cmds.recv() => {
-                let Some(cmd) = cmd else { break };
-                match cmd {
-                    Cmd::Prompt { ws, text } => {
-                        if !ensure(&shared, &mut sessions, &ev_tx, ws).await {
-                            continue;
-                        }
-                        let Some(session) = sessions.get_mut(&ws) else {
-                            continue;
-                        };
-                        if session.busy {
-                            send(UiMsg::Error(format!("ws{} is busy (/cancel first)", ws + 1)));
-                            continue;
-                        }
-                        session.busy = true;
-                        session.req_no += 1;
-                        let request_id = format!("ccti-{}-{}", ws, session.req_no);
-                        let full = if session.first {
-                            session.first = false;
-                            format!("{SYSTEM}\n\n{text}")
-                        } else { text };
-                        let h = session.handle.clone();
-                        let ui2 = ui.clone();
-                        let rid = request_id.clone();
-                        tokio::spawn(async move {
-                            match h.prompt(Prompt::text(&rid, full)).await {
-                                Ok(_) => { let _ = ui2.send(UiMsg::AgentDone); }
-                                Err(e) => { let _ = ui2.send(UiMsg::Error(format!("prompt failed: {e}"))); }
-                            }
-                        });
-                        send(UiMsg::AgentBusy { ws, busy: true });
-                    }
-                    Cmd::SetChatModel { ws, model } => {
-                        if !ensure(&shared, &mut sessions, &ev_tx, ws).await {
-                            continue;
-                        }
-                        let h = match sessions.get(&ws) {
-                            Some(s) => s.handle.clone(),
-                            None => continue,
-                        };
-                        let ui2 = ui.clone();
-                        tokio::spawn(async move {
-                            match h.set_model(&model).await {
-                                Ok(cfg) => {
-                                    let shown = session_model_name(&cfg).unwrap_or(model.clone());
-                                    let _ = ui2.send(UiMsg::ChatModel { ws, model: shown });
-                                }
-                                Err(e) => {
-                                    let _ = ui2.send(UiMsg::Error(format!("chat model switch failed: {e}")));
-                                }
-                            }
-                        });
-                    }
-                    Cmd::Cancel { ws } => {
-                        if let Some(session) = sessions.get(&ws) {
-                            let h = session.handle.clone();
-                            let ui2 = ui.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = h.cancel().await {
-                                    let _ = ui2.send(UiMsg::Error(format!("cancel failed: {e}")));
-                                }
-                            });
-                        }
-                    }
+                // Announce the session's model once its configuration arrives.
+                if !announced.contains(&key)
+                    && let Some(cfg) = pool.session_configuration(&key).await
+                    && let Some(model) = cfg.model_display_name()
+                    && let Some(ws) = key_ws(&key)
+                {
+                    announced.insert(key.clone());
+                    send(UiMsg::SessionModel { ws, model });
                 }
-            }
-            msg = ev_rx.recv() => {
-                let Some((ws, ev)) = msg else { break };
-                let Some(session) = sessions.get_mut(&ws) else { continue };
-                let Some(se) = ev else {
-                    // Forwarder ended: session stream closed.
-                    session.busy = false;
-                    send(UiMsg::AgentBusy { ws, busy: false });
-                    send(UiMsg::Error(format!("agent stream closed (ws{})", ws + 1)));
-                    continue;
-                };
-                session.seq += 1;
-                let rid = se.request_id.clone().unwrap_or_default();
-                let SessionEvent { event, .. } = &se;
-                let conv_id = session.conv.id().to_string();
-                let _ = session.conv.apply(WireEvent::new(conv_id, rid.clone(), session.seq, event.clone()));
-                match event {
+                let rid = event.request_id.clone().unwrap_or_default();
+                let ccht::SessionEvent { event: payload, .. } = &*event;
+                match payload {
                     Event::Update { update } => match update {
-                        SessionUpdate::AgentMessageChunk(chunk) => {
-                            if let ContentBlock::Text(t) = &chunk.content {
-                                session.buf.push_str(&t.text);
-                            }
-                        }
-                        SessionUpdate::AgentThoughtChunk(_) => {}
+                        SessionUpdate::AgentMessageChunk(_)
+                        | SessionUpdate::AgentThoughtChunk(_) => {}
                         SessionUpdate::ToolCall(tc) => {
-                            send(UiMsg::Chat { ws: Some(ws), role: "tool".into(), text: format!("{} …", tc.title) });
+                            send(UiMsg::Chat {
+                                ws: key_ws(&key),
+                                role: "tool".into(),
+                                text: format!("{} …", tc.title),
+                            });
                         }
                         SessionUpdate::ToolCallUpdate(u) => {
                             if let Some(title) = u.fields.title.as_deref() {
-                                let st = u.fields.status.map(|s| format!("{s:?}")).unwrap_or_default();
+                                let st = u
+                                    .fields
+                                    .status
+                                    .map(|s| format!("{s:?}"))
+                                    .unwrap_or_default();
                                 send(UiMsg::Status(format!("{title} {st}")));
                             }
                         }
                         _ => {}
                     },
-                    Event::Permission { request_id, request } => {
+                    Event::Permission {
+                        request_id,
+                        request,
+                    } => {
                         let title = request.tool_call.fields.title.clone().unwrap_or_default();
                         let decision = decide(request);
                         let verdict = match &decision {
                             RequestPermissionOutcome::Selected(_) => "auto-allowed",
                             _ => "denied",
                         };
-                        let h = session.handle.clone();
+                        let pool2 = pool.clone();
                         let ui2 = ui.clone();
+                        let key2 = key.clone();
                         let request_id = request_id.clone();
                         tokio::spawn(async move {
-                            if h.respond_permission(&request_id, decision).await.is_err() {
+                            if pool2
+                                .respond_permission(&key2, &request_id, decision)
+                                .await
+                                .is_err()
+                            {
                                 let _ = ui2.send(UiMsg::Error("permission response failed".into()));
                             } else {
-                                let _ = ui2.send(UiMsg::Chat { ws: Some(ws), role: "sys".into(), text: format!("permission {verdict}: {title}") });
+                                let _ = ui2.send(UiMsg::Chat {
+                                    ws: key_ws(&key2),
+                                    role: "sys".into(),
+                                    text: format!("permission {verdict}: {title}"),
+                                });
                             }
                         });
                     }
                     Event::Completed { .. } => {
-                        if !session.buf.trim().is_empty() {
-                            let text = std::mem::take(&mut session.buf);
-                            send(UiMsg::Chat { ws: Some(ws), role: "agent".into(), text });
+                        let mut text = String::new();
+                        if let Some(conv) = pool.conversation(&key).await
+                            && let Some(turn) = conv.turns().iter().find(|t| t.request_id == rid)
+                        {
+                            text = turn.text.clone();
                         }
-                        session.busy = false;
-                        // Snapshots number events per turn: restart at 1 so the
-                        // next turn's events pass the conversation gap check.
-                        session.seq = 0;
-                        send(UiMsg::AgentBusy { ws, busy: any_busy(&sessions) });
+                        if !text.trim().is_empty() {
+                            send(UiMsg::Chat {
+                                ws: key_ws(&key),
+                                role: "agent".into(),
+                                text,
+                            });
+                        }
+                        if let Some(ws) = key_ws(&key) {
+                            send(UiMsg::AgentBusy { ws, busy: false });
+                        }
                     }
                     Event::Error { code, message } => {
-                        session.busy = false;
-                        session.seq = 0;
-                        send(UiMsg::AgentBusy { ws, busy: any_busy(&sessions) });
+                        if let Some(ws) = key_ws(&key) {
+                            send(UiMsg::AgentBusy { ws, busy: false });
+                        }
                         send(UiMsg::Error(format!("{code}: {message}")));
                     }
                 }
             }
+            PoolEvent::Ended { key } => {
+                // Forwarder drained: the session stream closed with no turn
+                // result. Clear the indicator and say so; local tools like
+                // /render keep working.
+                if let Some(ws) = key_ws(&key) {
+                    send(UiMsg::AgentBusy { ws, busy: false });
+                    send(UiMsg::Error(format!("agent stream closed (ws{})", ws + 1)));
+                }
+            }
         }
-    }
-    if let Some(client) = shared.client {
-        let _ = client.close().await;
     }
 }
 
@@ -411,50 +318,22 @@ user's language.";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn config_with_model(value: &str, label: &str) -> ccht::SessionConfiguration {
-        serde_json::from_value(json!({
-            "options": [{
-                "id": "model", "name": "Model", "category": "model", "type": "select",
-                "currentValue": value,
-                "options": [{"value": value, "name": label}]
-            }],
-            "modes": null
-        }))
-        .expect("test config")
+    #[test]
+    fn pool_keys_roundtrip_workspace_indexes() {
+        assert_eq!(pool_key(0), "ws0");
+        assert_eq!(pool_key(3), "ws3");
+        assert_eq!(key_ws("ws0"), Some(0));
+        assert_eq!(key_ws("ws3"), Some(3));
+        assert_eq!(key_ws("main"), None);
+        assert_eq!(key_ws(""), None);
     }
 
     #[test]
-    fn session_model_prefers_label_over_value() {
-        let cfg = config_with_model("muse-spark", "Muse Spark 1.3");
-        assert_eq!(session_model_name(&cfg), Some("Muse Spark 1.3".to_string()));
-    }
-
-    #[test]
-    fn session_model_falls_back_to_raw_value() {
-        let cfg: ccht::SessionConfiguration = serde_json::from_value(json!({
-            "options": [{
-                "id": "model", "name": "Model", "category": "model", "type": "select",
-                "currentValue": "mystery-9",
-                "options": [{"value": "other-1", "name": "Other"}]
-            }],
-            "modes": null
-        }))
-        .expect("test config");
-        assert_eq!(session_model_name(&cfg), Some("mystery-9".to_string()));
-    }
-
-    #[test]
-    fn session_model_absent_without_model_option() {
-        let cfg: ccht::SessionConfiguration = serde_json::from_value(json!({
-            "options": [{
-                "id": "thinking", "name": "Thinking", "type": "boolean",
-                "currentValue": false
-            }],
-            "modes": null
-        }))
-        .expect("test config");
-        assert_eq!(session_model_name(&cfg), None);
+    fn first_turn_carries_system_preamble_once() {
+        let first = first_turn_text(true, "hello");
+        assert!(first.starts_with(SYSTEM));
+        assert!(first.ends_with("hello"));
+        assert_eq!(first_turn_text(false, "hello"), "hello");
     }
 }
