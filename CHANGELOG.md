@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Package metadata points at the current GitHub repository.
+- Released from CI through crates.io trusted publishing.
+
 ## 0.1.9 — 2026-09-15
 
 - Muse Spark 1.3 is the default chat model (vision-capable): the agent
